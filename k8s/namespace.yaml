@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: iasw
+  labels:
+    name: iasw
+    environment: production

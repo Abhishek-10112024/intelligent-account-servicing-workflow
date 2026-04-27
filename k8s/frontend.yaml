@@ -1,0 +1,135 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# k8s/frontend.yaml — React Frontend Deployment for IASW
+#
+# Serves the production-built React app via nginx:alpine.
+#
+# Prerequisites:
+#   1. Build the frontend:
+#        cd frontend && npm run build
+#   2. Create an nginx image with the build output:
+#        docker build -f k8s/frontend.Dockerfile -t your-registry/iasw-frontend:latest frontend/
+#        docker push your-registry/iasw-frontend:latest
+#   3. Update the `image:` field below with your registry path.
+#
+# For local testing with Minikube:
+#   eval $(minikube docker-env)
+#   docker build -f k8s/frontend.Dockerfile -t iasw/frontend:latest frontend/
+#   # Then set imagePullPolicy: Never in the Deployment below
+# ──────────────────────────────────────────────────────────────────────────────
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iasw-frontend
+  namespace: iasw
+  labels:
+    app: iasw-frontend
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # Zero-downtime rollouts
+  selector:
+    matchLabels:
+      app: iasw-frontend
+  template:
+    metadata:
+      labels:
+        app: iasw-frontend
+    spec:
+      containers:
+      - name: frontend
+        # Replace with your container registry image (or use iasw-frontend:latest for local)
+        image: iasw-frontend:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+          name: http
+
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+
+        # Liveness probe — restart pod if nginx hangs
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # Readiness probe — only route traffic once nginx is serving
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2
+
+        # Inject the backend API URL via environment variable
+        # The React app should read VITE_API_URL at build time OR
+        # use a runtime config endpoint served by nginx
+        env:
+        - name: VITE_API_URL
+          valueFrom:
+            configMapKeyRef:
+              name: iasw-config
+              key: BACKEND_API_URL
+              optional: true
+
+      # Spread pods across nodes for HA
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - iasw-frontend
+              topologyKey: kubernetes.io/hostname
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iasw-frontend-service
+  namespace: iasw
+  labels:
+    app: iasw-frontend
+spec:
+  type: ClusterIP
+  selector:
+    app: iasw-frontend
+  ports:
+  - port: 80
+    targetPort: 80
+    name: http
+
+---
+# ── nginx Dockerfile hint (save as k8s/frontend.Dockerfile) ──────────────────
+# FROM node:20-alpine AS builder
+# WORKDIR /app
+# COPY package*.json ./
+# RUN npm ci
+# COPY . .
+# RUN npm run build
+#
+# FROM nginx:alpine
+# COPY --from=builder /app/dist /usr/share/nginx/html
+# # Optional: custom nginx.conf for SPA routing
+# # COPY nginx.conf /etc/nginx/conf.d/default.conf
+# EXPOSE 80
+# CMD ["nginx", "-g", "daemon off;"]
