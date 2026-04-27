@@ -7,42 +7,54 @@
 
 ## 🏗 Architecture
 
+```mermaid
+flowchart TD
+    subgraph FE["React Frontend (port 5173 / 3000)"]
+        SF["📋 Staff Intake Form\nCustomer ID · Old Name · New Name · Document"]
+        CU["🔍 Checker Review UI\nAI Summary · Scores · Approve / Reject"]
+    end
+
+    subgraph BE["FastAPI Backend (Uvicorn · port 8000)"]
+        I["POST /api/intake\n202 Accepted + task_id\n⏱ Rate limited: 10 req/min"]
+        T["GET /api/tasks/{id}\nAsync poll"]
+        Q["GET /api/checker/queue\nRedis cached · TTL 30s"]
+        D["POST /api/checker/decide\n🛑 HITL BOUNDARY"]
+        R["POST /api/rps/write\nGated by checker_decision"]
+    end
+
+    subgraph LG["LangGraph Pipeline (Thread Pool)"]
+        A1["Agent 1: Validation\nRPS lookup · old-value check"]
+        A2["Agent 2: Document Processor\nGemini 1.5 Flash Vision\nOCR + forgery heuristic"]
+        A3["Agent 3: Confidence Scorer\nFuzzy match · 5-priority chain\nAI summary generation"]
+        ST["Stage to DB\nAI_VERIFIED_PENDING_HUMAN"]
+    end
+
+    subgraph DB["Persistence"]
+        PG[("PostgreSQL\npending_requests\naudit_log")]
+        RD[("Redis\nChecker queue cache")]
+        FS["FileNet Mock\nUploaded documents"]
+    end
+
+    SF -->|"multipart/form-data"| I
+    I -->|"202 + task_id"| SF
+    I -->|"asyncio.create_task"| A1
+    SF -->|"poll every 1s"| T
+    CU -->|"poll queue"| Q
+    CU -->|"checker_id + decision"| D
+    A1 --> A2 --> A3 --> ST
+    ST --> PG
+    A2 --> FS
+    Q --> RD
+    D --> PG
+    D --> RD
+    D --> R
+    R -->|"Only if APPROVED"| PG
+
+    style D fill:#ff6b6b,color:#fff
+    style ST fill:#ffa94d,color:#fff
 ```
-┌─────────────────────────────────────────────────────────┐
-│          React Frontend  (dev: 5173 · prod Docker: 3000) │
-│  Staff Intake Form ──────────── Checker Review Dashboard │
-└───────────────────┬─────────────────────┬───────────────┘
-                    │ HTTP/REST            │ HTTP/REST
-┌───────────────────▼─────────────────────▼───────────────┐
-│           FastAPI Backend  (Uvicorn · port 8000)          │
-│                                                           │
-│  POST /api/intake  →  202 Accepted  →  task_id           │
-│  GET  /api/tasks/{id}  (poll for status)                  │
-│  GET  /api/checker/queue  (Redis-cached, TTL 30s)         │
-│  POST /api/checker/decide                                 │
-│  POST /api/rps/write  (HITL gated)                        │
-│  GET  /health                                             │
-├───────────────────────────────────────────────────────────┤
-│           LangGraph Pipeline  (asyncio thread pool)        │
-│                                                           │
-│  [Agent 1]              [Agent 2]            [Agent 3]    │
-│  Validation Agent  →  Doc Processor  →  Confidence Scorer │
-│  RPS cross-check      Gemini OCR/NLP    Fuzzy match + AI  │
-│                             │                             │
-│                      ═══ HITL BOUNDARY ═══               │
-│                             │                             │
-│                    [Checker Review UI]                    │
-│                     Human Approve/Reject                  │
-│                             │                             │
-│                     [Mock RPS Write]                      │
-└──────────┬────────────────────────────────────┬──────────┘
-           │                                    │
-┌──────────▼──────────┐              ┌──────────▼──────────┐
-│   PostgreSQL         │              │   Redis              │
-│   PendingRequest     │              │   Checker queue cache│
-│   AuditLog           │              │   TTL = 30s          │
-└─────────────────────┘              └─────────────────────┘
-```
+
+> **Sync/Async boundary:** `POST /api/intake` returns `202 Accepted` instantly. The LangGraph pipeline runs in a background thread pool — the UI polls `GET /api/tasks/{id}` every second until `COMPLETED`.
 
 ---
 
