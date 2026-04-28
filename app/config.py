@@ -99,9 +99,10 @@ class Settings:
     # ── Mock RPS seed data ─────────────────────────────────────────────────────
     # In production this would be fetched from the actual RPS core banking system.
     MOCK_RPS_RECORDS: dict = {
-        "C001": {"name": "Priya Sharma", "dob": "1990-03-15", "address": "12 MG Road, Mumbai", "phone": "9876543210", "email": "priya.sharma@email.com"},
-        "C002": {"name": "Rahul Verma",  "dob": "1985-07-22", "address": "45 Brigade Rd, Bengaluru", "phone": "9123456789", "email": "rahul.verma@email.com"},
-        "C003": {"name": "Anita Nair",   "dob": "1992-11-08", "address": "7 Anna Salai, Chennai",  "phone": "9988776655", "email": "anita.nair@email.com"},
+        "C001": {"name": "Priya Sharma", "dob": "1990-03-15", "address": "12 MG Road, Mumbai",          "phone": "9876543210", "email": "priya.sharma@email.com"},
+        "C002": {"name": "Rahul Verma",  "dob": "1985-07-22", "address": "45 Brigade Rd, Bengaluru",    "phone": "9123456789", "email": "rahul.verma@email.com"},
+        "C003": {"name": "Anita Nair",   "dob": "1992-11-08", "address": "7 Anna Salai, Chennai",       "phone": "9988776655", "email": "anita.nair@email.com"},
+        "C004": {"name": "Sarita Devi",  "dob": "1988-01-01", "address": "Village Dadu Pur Roran, PO Sirsi, Distt. Karnal, Haryana", "phone": "9000000004", "email": "sarita.devi@email.com"},
     }
 
 
