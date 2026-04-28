@@ -1,437 +1,329 @@
 # IASW Deployment Guide
 
-This document covers everything needed to run, manage, and (optionally) deploy the Intelligent Account Servicing Workflow.
+> Complete guide for running the Intelligent Account Servicing Workflow in Docker (local) and Kubernetes (production/cloud).
 
 ---
 
-## Current Setup — What's Running
+## Table of Contents
 
-| Service | How it runs | URL | Port |
-|---------|-------------|-----|------|
-| FastAPI Backend | Docker Compose | http://localhost:8000 | 8000 |
-| PostgreSQL | Docker Compose | internal | 5432 |
-| Redis | Docker Compose | internal | 6379 |
-| React Frontend (dev) | `npm run dev` | http://localhost:5173 | 5173 |
-| React Frontend (prod) | Docker container | http://localhost:3000 | 3000 |
-
-> You only need **one** frontend — either dev mode (5173) or Docker prod (3000). Not both.
+1. [Docker Compose — Local Full Stack](#docker-compose)
+2. [Local Dev Without Docker](#local-dev)
+3. [Environment Variables Reference](#environment-variables)
+4. [Kubernetes — Production Deployment](#kubernetes)
+5. [Database Operations](#database-operations)
+6. [Troubleshooting](#troubleshooting)
 
 ---
 
-## Local Deployment — Quick Reference
+## Docker Compose — Local Full Stack <a name="docker-compose"></a>
 
-### Start Everything
+### What starts
 
-```bash
-cd "Intelligent Account Servicing Workflow"
-
-# 1. Backend stack (DB + Redis + FastAPI)
-docker-compose up -d
-
-# 2a. Frontend — Dev mode (hot reload, for development)
-cd frontend && npm run dev
-# → http://localhost:5173
-
-# 2b. Frontend — Production Docker (nginx, for demos)
-docker run -d --name iasw-frontend -p 3000:80 iasw-frontend:latest
-# → http://localhost:3000
+```
+docker compose up -d
 ```
 
-### Stop Everything
+| Service | Image | Port | Purpose |
+|---------|-------|------|---------|
+| `db` | postgres:15 | 5432 | PostgreSQL — all 5 tables |
+| `redis` | redis:7-alpine | 6379 | Checker queue cache (TTL 30s) |
+| `backend` | Built from `Dockerfile` | 8000 | FastAPI + LangGraph pipeline |
+| `frontend` | Built from `k8s/frontend.Dockerfile` | 5173 | React SPA served by nginx |
+
+### First-time setup
 
 ```bash
-# Stop backend stack
-docker-compose down
-
-# Stop frontend container (if running in Docker)
-docker stop iasw-frontend && docker rm iasw-frontend
-
-# Stop dev server — Ctrl+C in the npm run dev terminal
-```
-
-### Check Status
-
-```bash
-# All services
-docker-compose ps
-docker ps --filter "name=iasw-frontend"
-
-# Health check
-curl http://localhost:8000/health
-```
-
-### View Logs
-
-```bash
-# Backend logs (live)
-docker-compose logs -f backend
-
-# All services
-docker-compose logs -f
-
-# Structured JSON logs (human readable)
-tail -f logs/iasw.log | python3 -m json.tool
-```
-
----
-
-## Rebuild After Code Changes
-
-### Backend changed (Python files)
-
-```bash
-docker-compose build backend --no-cache
-docker-compose up -d backend
-```
-
-### Frontend changed (React/JSX files)
-
-```bash
-# Dev mode: Vite hot-reloads automatically — nothing to do
-
-# Production Docker: rebuild the image
-cd "Intelligent Account Servicing Workflow"
-cd frontend && npm run build && cd ..
-docker stop iasw-frontend && docker rm iasw-frontend
-docker build -f k8s/frontend.Dockerfile -t iasw-frontend:latest ./frontend
-docker run -d --name iasw-frontend -p 3000:80 iasw-frontend:latest
-```
-
-> **Important:** Always run `docker build` from the **project root** (not from `frontend/`), using `./frontend` as the build context.
-
----
-
-## Environment Configuration
-
-Copy `.env.example` to `.env` and configure:
-
-```bash
+# 1. Copy and configure environment
 cp .env.example .env
+#    Set GEMINI_API_KEY and JWT_SECRET at minimum
+
+# 2. Build and start
+docker compose up -d
+
+# 3. Verify all services are healthy
+docker compose ps
 ```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GEMINI_API_KEY` | _(blank)_ | Leave blank for mock mode; set for real Gemini OCR |
-| `GEMINI_STRICT` | `false` | Set `true` to disable mock fallback in demos |
-| `DATABASE_URL` | `sqlite:///./iasw.db` | Local dev SQLite; Docker uses PostgreSQL automatically |
-| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection string |
-| `ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:3000` | CORS allowlist — add your production domain here |
-| `RATE_LIMIT` | `10/minute` | Max intake submissions per minute per IP |
+Expected output:
+```
+NAME                                          STATUS
+intelligentaccountservicingworkflow-db-1      Up (healthy)
+intelligentaccountservicingworkflow-redis-1   Up (healthy)
+intelligentaccountservicingworkflow-backend-1 Up (healthy)
+intelligentaccountservicingworkflow-frontend-1 Up
+```
 
-> Docker Compose overrides `DATABASE_URL` and `REDIS_URL` automatically with internal service hostnames. You don't need to change these for Docker.
+### What happens on first startup (automatic)
 
----
+The backend startup hook runs three idempotent seeds:
 
-## Build the Frontend Docker Image
+1. **Database tables** — `init_db()` creates all 5 tables via SQLAlchemy
+2. **Seed users** — `admin/admin123` (ADMIN) and `user/user123` (USER) created in `users` table
+3. **Seed RPS records** — 3 demo customers (C001, C002, C003) inserted into `rps_records`
 
-> **Prerequisite:** Node.js 20+ must be installed (`node --version`)  
-> Vite v8 (used in this project) requires Node.js 20.19+ or 22.12+.
+All seeds are **idempotent** — safe to run on every restart, won't duplicate rows.
+
+### Common Docker commands
 
 ```bash
-# From project root:
-cd "Intelligent Account Servicing Workflow"
+# Start all services
+docker compose up -d
 
-# Step 1: Build the React app
-cd frontend && npm run build && cd ..
+# Stop and remove containers (keep volumes/data)
+docker compose down
 
-# Step 2: Build the Docker image (always from project root)
-docker build -f k8s/frontend.Dockerfile -t iasw-frontend:latest ./frontend
+# Stop and WIPE all data (fresh start)
+docker compose down -v
 
-# Step 3: Run it
-docker run -d --name iasw-frontend -p 3000:80 iasw-frontend:latest
+# View live logs
+docker compose logs backend -f
+docker compose logs frontend -f
 
-# Verify
-curl -s -o /dev/null -w "HTTP %{http_code}" http://localhost:3000
-# → HTTP 200
+# Rebuild after code changes
+docker compose build backend   # after Python changes
+docker compose build frontend  # after React changes
+docker compose up -d           # apply rebuilt images
+
+# Rebuild everything from scratch
+docker compose build --no-cache
+docker compose up -d
 ```
 
 ---
 
-## Async Pipeline — How It Works
+## Local Dev Without Docker <a name="local-dev"></a>
 
-```
-POST /api/intake
-    │
-    ├─ Duplicate guard (409 if customer already has open request of same type)
-    ├─ File validation (max 20MB, non-empty)
-    ├─ Return 202 Accepted { task_id, poll_url }   ← instant response
-    │
-    └─ asyncio thread pool → run_iasw_pipeline()   ← runs in background
-           ├─ Agent 1: Validation (RPS cross-check)
-           ├─ Agent 2: Document Processing (Gemini multimodal OCR)
-           └─ Agent 3: Confidence Scoring (fuzzy match + 5-priority chain)
-                  └─ DB write → AI_VERIFIED_PENDING_HUMAN
-
-GET /api/tasks/{task_id}   ← responds in <55ms while pipeline runs
-    └─ { status: QUEUED | RUNNING | COMPLETED | FAILED }
-```
-
----
-
-## API Reference
-
-### `POST /api/intake` — Submit change request
-
-Returns `202 Accepted` immediately with a `task_id` for polling.
+### Backend
 
 ```bash
-curl -X POST http://localhost:8000/api/intake \
-  -F customer_id=C001 \
-  -F change_type=LEGAL_NAME_CHANGE \
-  -F old_value="Priya Sharma" \
-  -F new_value="Priya Mehta" \
-  -F document_type=MARRIAGE_CERTIFICATE \
-  -F document=@/path/to/document.pdf
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment (SQLite used automatically in local dev)
+cp .env.example .env
+# Set GEMINI_API_KEY in .env
+
+# Start backend
+uvicorn app.main:app --reload --port 8000
 ```
 
-**Responses:**
-- `202` — Accepted, `{ task_id, poll_url }`
-- `409` — Duplicate: customer already has open request of same change type
-- `422` — Validation error (missing fields)
-- `429` — Rate limited (10/min per IP)
+The backend starts with:
+- SQLite database (`iasw.db`) auto-created
+- Redis optional — if not running, checker queue caching is disabled (system still works)
+- Demo users and RPS records seeded automatically
 
----
-
-### `GET /api/tasks/{task_id}` — Poll task status
+### Frontend
 
 ```bash
-curl http://localhost:8000/api/tasks/3468dd86-7454-4310-8444-f64459575308
+cd frontend
+npm install
+npm run dev
 ```
 
-```json
-{
-  "task_id": "3468dd86-...",
-  "status": "COMPLETED",
-  "result": {
-    "request_id": "46491c8e-...",
-    "final_status": "AI_VERIFIED_PENDING_HUMAN"
-  }
-}
-```
-
-| `status` | Meaning |
-|----------|---------|
-| `QUEUED` | Waiting in queue |
-| `RUNNING` | Pipeline executing (Gemini processing) |
-| `COMPLETED` | Done — check `result.final_status` |
-| `FAILED` | Pipeline error — check `result.error` |
-
-**`final_status` values:**
-
-| Value | Meaning |
-|-------|---------|
-| `AI_VERIFIED_PENDING_HUMAN` | ✅ In checker queue — awaiting human decision |
-| `VALIDATION_FAILED` | ❌ Customer ID not found or old value mismatch |
+Opens at `http://localhost:5173`. API calls go to `http://localhost:8000`.
 
 ---
 
-### `GET /api/checker/queue` — Pending requests for checker
+## Environment Variables Reference <a name="environment-variables"></a>
+
+Copy `.env.example` → `.env`. Never commit `.env`.
+
+### Required
+
+| Variable | Example | Notes |
+|----------|---------|-------|
+| `GEMINI_API_KEY` | `AIza...` | Leave blank for mock mode (no Gemini calls) |
+| `JWT_SECRET` | `change-me-in-prod` | **Must be changed** in production |
+
+### Gemini
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `GEMINI_MODEL` | `gemini-2.5-flash-preview-04-17` | Best for document vision. Options: `gemini-2.0-flash`, `gemini-1.5-pro` |
+| `GEMINI_STRICT` | `false` | `true` = fail on Gemini errors instead of fallback to mock |
+
+### Database
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `DATABASE_URL` | `sqlite:///./iasw.db` | Local dev. Docker overrides with PostgreSQL URL. |
+
+### Auth
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `JWT_EXPIRE_MINUTES` | `60` | Token TTL in minutes |
+| `SEED_ADMIN_USERNAME` | `admin` | Default admin username |
+| `SEED_ADMIN_PASSWORD` | `admin123` | **Change in production** |
+| `SEED_USER_USERNAME` | `user` | Default user username |
+| `SEED_USER_PASSWORD` | `user123` | **Change in production** |
+
+### Thresholds
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `APPROVE_THRESHOLD` | `0.80` | Overall confidence ≥ this → APPROVE |
+| `FLAG_THRESHOLD` | `0.60` | Confidence between FLAG and APPROVE → FLAG (human review) |
+| `RATE_LIMIT` | `10/minute` | Intake submissions per IP per minute |
+
+---
+
+## Kubernetes — Production Deployment <a name="kubernetes"></a>
+
+Kubernetes manifests are in the `k8s/` directory, targeting GKE (adaptable to EKS / AKS).
+
+### Manifests
+
+| File | Resource |
+|------|---------|
+| `k8s/namespace.yaml` | `iasw` namespace |
+| `k8s/secrets.yaml` | Database passwords, JWT secret, Gemini key |
+| `k8s/configmap.yaml` | Non-secret configuration |
+| `k8s/postgres.yaml` | PostgreSQL StatefulSet + Service |
+| `k8s/redis.yaml` | Redis Deployment + Service |
+| `k8s/backend.yaml` | FastAPI Deployment + Service |
+| `k8s/frontend.yaml` | React/nginx Deployment + Service |
+| `k8s/ingress.yaml` | Ingress (HTTPS, path-based routing) |
+
+### Deploy to Kubernetes
 
 ```bash
-curl http://localhost:8000/api/checker/queue
-```
-
-Returns all `AI_VERIFIED_PENDING_HUMAN` records. Cached in Redis with 30s TTL.
-
----
-
-### `POST /api/checker/decide` — Approve or reject
-
-```bash
-curl -X POST http://localhost:8000/api/checker/decide \
-  -H "Content-Type: application/json" \
-  -d '{
-    "request_id": "46491c8e-...",
-    "checker_id": "checker_sup_01",
-    "decision": "APPROVED",
-    "notes": "Documents verified, signature matches."
-  }'
-```
-
----
-
-### `GET /health` — System health
-
-```bash
-curl http://localhost:8000/health
-```
-
-```json
-{
-  "status": "ok",
-  "version": "1.0.0",
-  "llm_mode": "gemini",
-  "cache": "connected",
-  "timestamp": 22213.843
-}
-```
-
----
-
-## Security Notes
-
-### CORS
-Origins are **not** wildcarded. Set `ALLOWED_ORIGINS` in `.env`:
-```bash
-# Local dev (default)
-ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
-
-# Production — replace with your actual domain
-ALLOWED_ORIGINS=https://iasw.yourbank.com
-```
-
-### Validation error data privacy
-When a submitted old-value doesn't match the record, the error message does **not** reveal the actual value on record:
-```
-✅ "The current value submitted for customer 'C001' does not match what is on record."
-❌ "Submitted 'Wrong' does not match RPS record 'Priya Sharma'."  ← old behaviour, removed
-```
-
-### Duplicate submission guard
-Blocks on `customer_id + change_type` — one open request per customer per change type, regardless of what new value is requested.
-
-### HITL boundary
-The AI pipeline **cannot** write to RPS. Three independent enforcement layers:
-1. No RPS write node in the LangGraph graph
-2. `POST /api/rps/write` checks `checker_id IS NOT NULL` before executing
-3. DB constraint enforces `checker_id` requirement
-
----
-
-## Confidence Scoring
-
-5-priority decision chain (highest priority first):
-
-```
-1. forgery_check == FAIL     → REJECT
-2. forgery_check == WARN     → FLAG
-3. document_type mismatch    → REJECT
-4. missing required fields   → REJECT
-5. score threshold:
-      ≥ 0.80  → APPROVE
-      0.60–0.79 → FLAG
-      < 0.60  → REJECT
-```
-
-Score formula:
-```
-overall = (name_match × 0.6) + (authenticity × 0.4)
-```
-
----
-
-## Kubernetes (Cloud Deployment)
-
-> This section is for deploying to a real cloud cluster (GKE / EKS / AKS).  
-> **Not required for local demos or the technical assignment.**
-
-### Prerequisites
-- A Kubernetes cluster (Docker Desktop k8s, Minikube, or cloud)
-- `kubectl` configured (`kubectl get nodes` works)
-- A container registry (Docker Hub, GCR, ECR, etc.)
-
-### Steps
-
-```bash
-# 1. Build and push backend image
+# 1. Set your registry and image tags in k8s/*.yaml
+# 2. Build and push images
 docker build -t your-registry/iasw-backend:latest .
 docker push your-registry/iasw-backend:latest
 
-# 2. Build and push frontend image (from project root)
 docker build -f k8s/frontend.Dockerfile -t your-registry/iasw-frontend:latest ./frontend
 docker push your-registry/iasw-frontend:latest
 
-# 3. Update image fields in k8s/frontend.yaml
-#    Change: image: iasw-frontend:latest
-#    To:     image: your-registry/iasw-frontend:latest
+# 3. Update secrets (base64 encoded)
+echo -n "your-jwt-secret" | base64
+echo -n "your-gemini-key" | base64
+# Paste into k8s/secrets.yaml
 
-# 4. Create namespace
-kubectl create namespace iasw
-
-# 5. Deploy frontend
+# 4. Apply manifests in order
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/secrets.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/postgres.yaml
+kubectl apply -f k8s/redis.yaml
+kubectl apply -f k8s/backend.yaml
 kubectl apply -f k8s/frontend.yaml
+kubectl apply -f k8s/ingress.yaml
 
-# 6. Verify
+# 5. Verify
 kubectl get pods -n iasw
-kubectl get svc -n iasw
-```
-
-### What the k8s manifests include
-
-| Feature | Detail |
-|---------|--------|
-| Replicas | 2 frontend pods |
-| Rolling updates | Zero-downtime (`maxUnavailable: 0`) |
-| Health probes | Liveness + readiness on port 80 |
-| Anti-affinity | Pods spread across nodes |
-| Resource limits | CPU 200m, Memory 128Mi |
-
----
-
-## Troubleshooting
-
-### Backend container keeps restarting
-
-```bash
-docker-compose logs backend --tail=30
-```
-
-Common causes:
-- `DATABASE_URL` wrong — check `.env` and docker-compose environment overrides
-- `GEMINI_API_KEY` invalid format — set to blank for mock mode
-
-### Redis connection warning on startup
-
-```
-Redis not available — running without cache
-```
-
-This is non-fatal. The system works without Redis — checker queue just hits the DB on every request. To fix:
-```bash
-docker-compose up -d redis
-```
-
-### Frontend shows "Network Error" on submit
-
-The frontend at `localhost:3000` is trying to reach `localhost:8000`. Verify:
-```bash
-curl http://localhost:8000/health   # Should return {"status":"ok"}
-docker-compose ps                  # backend should be "Up (healthy)"
-```
-
-### Vite build fails with "Node.js version" error
-
-```
-Vite requires Node.js version 20.19+ or 22.12+
-```
-
-Upgrade Node.js:
-```bash
-# Using nvm:
-nvm install 20 && nvm use 20
-node --version   # Should show v20.x.x
-```
-
-### docker build fails: "lstat k8s: no such file or directory"
-
-You ran the command from the wrong directory. **Always run from the project root:**
-```bash
-# ❌ Wrong — running from frontend/
-docker build -f k8s/frontend.Dockerfile ...
-
-# ✅ Correct — from project root
-cd "Intelligent Account Servicing Workflow"
-docker build -f k8s/frontend.Dockerfile -t iasw-frontend:latest ./frontend
+kubectl get services -n iasw
 ```
 
 ---
 
-## Mock RPS Customers (Test Data)
+## Database Operations <a name="database-operations"></a>
 
-| Customer ID | Name | Change Type to test |
-|-------------|------|---------------------|
-| `C001` | Priya Sharma | `LEGAL_NAME_CHANGE` |
-| `C002` | Rahul Verma | `LEGAL_NAME_CHANGE` |
-| `C003` | Meena Iyer | `LEGAL_NAME_CHANGE` |
+### View tables (Docker)
 
-Use these exact values as "Old Name" in the intake form to pass validation.
+```bash
+# Connect to PostgreSQL
+docker compose exec db psql -U postgres -d iasw_db
+
+# List all tables
+\dt
+
+# View RPS records (mock core banking)
+SELECT customer_id, name, dob, address FROM rps_records;
+
+# View pending change requests
+SELECT id, customer_id, overall_status, ai_recommendation, confidence_name
+FROM pending_requests
+ORDER BY created_at DESC;
+
+# View audit trail for a request
+SELECT actor, action, detail, created_at
+FROM audit_log
+WHERE request_id = '<paste-request-id>'
+ORDER BY created_at;
+
+# View all users
+SELECT username, role, active, created_at FROM users;
+
+# View pending registrations
+SELECT username, requested_role, status, created_at FROM user_registrations;
+```
+
+### Reset database (fresh start)
+
+```bash
+docker compose down -v    # removes postgres_data and redis_data volumes
+docker compose up -d      # recreates with fresh seed data
+```
+
+### Backup database
+
+```bash
+docker compose exec db pg_dump -U postgres iasw_db > backup_$(date +%Y%m%d).sql
+```
+
+### Restore database
+
+```bash
+cat backup_20240429.sql | docker compose exec -T db psql -U postgres -d iasw_db
+```
+
+---
+
+## Troubleshooting <a name="troubleshooting"></a>
+
+### Backend won't start
+
+```bash
+# Check logs
+docker compose logs backend --tail=50
+
+# Common causes:
+# - Missing .env file  → cp .env.example .env
+# - DB not ready      → wait 15s, or check docker compose ps
+# - Port 8000 in use  → lsof -i :8000 and kill the process
+```
+
+### "Container name already in use" error
+
+```bash
+docker stop iasw-frontend && docker rm iasw-frontend
+# Then re-run docker compose up -d
+```
+
+### Frontend shows blank page / cannot reach API
+
+1. Check backend is running: `curl http://localhost:8000/health`
+2. Check CORS: `ALLOWED_ORIGINS` in `.env` must include `http://localhost:5173`
+3. Check browser console for 401 — you may need to log in again (JWT expired)
+
+### Gemini returning mock results
+
+1. Check `GEMINI_API_KEY` is set in `.env`
+2. Verify health endpoint: `curl http://localhost:8000/health` → `"llm_mode": "gemini"`
+3. If still mock: check Docker picked up the new `.env` → `docker compose down && docker compose up -d`
+
+### High false-positive rejection rate on valid documents
+
+- The system uses `gemini-2.5-flash-preview-04-17` for document analysis
+- Make sure the document is clearly photographed (not blurry, not a screenshot of a screenshot)
+- Supported document types: Marriage Certificate, Gazette Notification, Deed Poll
+
+### Check which Gemini model is active
+
+```bash
+docker compose logs backend | grep GEMINI_MODEL_SELECTED
+```
+
+### Redis not connecting (graceful degradation)
+
+Redis is optional. If unavailable, the checker queue won't be cached but everything else works. Check:
+```bash
+docker compose ps redis
+docker compose exec redis redis-cli ping   # should return PONG
+```

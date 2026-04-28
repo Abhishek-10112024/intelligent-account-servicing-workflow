@@ -9,33 +9,37 @@
 
 ```mermaid
 flowchart TD
-    subgraph FE["React Frontend (port 5173 / 3000)"]
+    subgraph FE["React Frontend (port 5173)"]
+        LG["🔐 Login / Register"]
         SF["📋 Staff Intake Form\nCustomer ID · Old Name · New Name · Document"]
         CU["🔍 Checker Review UI\nAI Summary · Scores · Approve / Reject"]
+        RG["👥 Registration Queue\nAdmin approves new users"]
     end
 
     subgraph BE["FastAPI Backend (Uvicorn · port 8000)"]
+        AU["POST /api/auth/login\nPOST /api/auth/register\nGET  /api/auth/me"]
         I["POST /api/intake\n202 Accepted + task_id\n⏱ Rate limited: 10 req/min"]
         T["GET /api/tasks/{id}\nAsync poll"]
         Q["GET /api/checker/queue\nRedis cached · TTL 30s"]
         D["POST /api/checker/decide\n🛑 HITL BOUNDARY"]
-        R["POST /api/rps/write\nGated by checker_decision"]
+        R["POST /api/rps/write\nGated by checker_decision=APPROVED"]
     end
 
-    subgraph LG["LangGraph Pipeline (Thread Pool)"]
-        A1["Agent 1: Validation\nRPS lookup · old-value check"]
-        A2["Agent 2: Document Processor\nGemini Vision extraction\n+ dedicated forgery pass\n+ code-level metadata/magic-byte checks"]
-        A3["Agent 3: Confidence Scorer\nFuzzy match · 5-priority chain\nAI summary generation"]
+    subgraph LGP["LangGraph Pipeline (Thread Pool)"]
+        A1["Agent 1: Validation\nRPS DB lookup · old-value check"]
+        A2["Agent 2: Document Processor\nGemini 2.5 Flash Vision\nis_valid_document check\nOCR + code forgery + Gemini forgery"]
+        A3["Agent 3: Confidence Scorer\nPriority 0: selfie/screenshot guard\nFuzzy match · 5-priority chain\nAI summary generation"]
         ST["Stage to DB\nAI_VERIFIED_PENDING_HUMAN"]
     end
 
     subgraph DB["Persistence"]
-        PG[("PostgreSQL\npending_requests\naudit_log")]
-        RD[("Redis\nChecker queue cache")]
+        PG[("PostgreSQL\npending_requests\naudit_log\nusers\nuser_registrations\nrps_records")]
+        RD[("Redis\nChecker queue cache\nTTL 30s")]
         FS["FileNet Mock\nUploaded documents"]
     end
 
-    SF -->|"multipart/form-data"| I
+    LG -->|"JWT token"| SF
+    SF -->|"multipart/form-data + Bearer"| I
     I -->|"202 + task_id"| SF
     I -->|"asyncio.create_task"| A1
     SF -->|"poll every 1s"| T
@@ -52,128 +56,192 @@ flowchart TD
 
     style D fill:#ff6b6b,color:#fff
     style ST fill:#ffa94d,color:#fff
+    style A2 fill:#339af0,color:#fff
 ```
 
-> **Sync/Async boundary:** `POST /api/intake` returns `202 Accepted` instantly. The LangGraph pipeline runs in a background thread pool — the UI polls `GET /api/tasks/{id}` every second until `COMPLETED`.
+> **Async boundary:** `POST /api/intake` returns `202 Accepted` instantly. The LangGraph pipeline runs in a background thread pool — the UI polls `GET /api/tasks/{id}` every second until `COMPLETED`.
 
 ---
 
-## 🚀 Quick Start
+## 🚀 Quick Start (Docker Compose — Recommended)
 
 ### Prerequisites
+- Docker Desktop running
+- A Gemini API key from [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| Python | 3.11+ | Backend |
-| Node.js | **20+** | React frontend (Vite 8 requires Node 20.19+) |
-| Docker Desktop | Latest | Full stack (recommended) |
-| Gemini API Key | Optional | Real OCR; mock mode works without it |
-
----
-
-### Option A — Docker Compose (recommended)
-
-Runs the full stack (Backend + PostgreSQL + Redis) in one command.
+### 1. Configure environment
 
 ```bash
-cd "Intelligent Account Servicing Workflow"
-
-# 1. Configure environment
 cp .env.example .env
-# Edit .env — add GEMINI_API_KEY if you have one
-
-# 2. Start backend stack (DB + Redis + FastAPI)
-docker-compose up -d
-
-# 3a. Frontend — Dev mode (hot reload, recommended for development)
-cd frontend && npm install && npm run dev
-# → http://localhost:5173
-
-# 3b. Frontend — Production Docker (nginx, recommended for demos)
-# Run from project root:
-docker build -f k8s/frontend.Dockerfile -t iasw-frontend:latest ./frontend
-docker run -d --name iasw-frontend -p 3000:80 iasw-frontend:latest
-# → http://localhost:3000
+# Open .env and set:
+#   GEMINI_API_KEY=your_actual_key
+#   JWT_SECRET=any-long-random-string
 ```
 
-| Service | Dev URL | Prod Docker URL |
-|---------|---------|----------------|
-| **React Frontend** | http://localhost:5173 | http://localhost:3000 |
-| **FastAPI Backend** | http://localhost:8000 | http://localhost:8000 |
-| **API Docs** | http://localhost:8000/docs | http://localhost:8000/docs |
-| **Health Check** | http://localhost:8000/health | http://localhost:8000/health |
+### 2. Start the full stack
 
-**To stop:**
 ```bash
-docker-compose down                                     # stop backend stack
-docker stop iasw-frontend && docker rm iasw-frontend    # stop frontend (if Docker)
-# Ctrl+C in terminal                                    # stop npm run dev
+docker compose up -d
 ```
+
+This starts 4 containers:
+
+| Container | Purpose | Port |
+|-----------|---------|------|
+| `db` | PostgreSQL 15 | 5432 |
+| `redis` | Redis 7 (cache) | 6379 |
+| `backend` | FastAPI + LangGraph | 8000 |
+| `frontend` | React + Vite (nginx) | 5173 |
+
+### 3. Open the app
+
+| URL | Description |
+|-----|-------------|
+| `http://localhost:5173` | Main application (Login → Intake / Checker) |
+| `http://localhost:8000/docs` | Interactive Swagger API docs |
+| `http://localhost:8000/health` | System health (LLM mode, cache status) |
+
+### 4. Demo credentials (auto-seeded)
+
+| Role | Username | Password | Can Do |
+|------|----------|---------|--------|
+| **Admin** | `admin` | `admin123` | Submit requests, view checker queue, approve/reject, manage registrations |
+| **Staff User** | `user` | `user123` | Submit intake requests only |
 
 ---
 
-### Option B — Local Development
+## 🖥 Local Dev (Without Docker)
 
 ```bash
-cd "Intelligent Account Servicing Workflow"
-
-# 1. Python virtual environment
-python3 -m venv venv
-source venv/bin/activate          # macOS/Linux
-# OR: venv\Scripts\activate       # Windows
-
-# 2. Install dependencies
+# Backend
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-
-# 3. Configure environment
-cp .env.example .env
-# Edit .env — add GEMINI_API_KEY (optional)
-
-# 4. Start backend
 uvicorn app.main:app --reload --port 8000
 
-# 5. Start frontend (separate terminal)
-cd frontend
-npm install
-npm run dev
+# Frontend (separate terminal)
+cd frontend && npm install && npm run dev
 ```
 
-> **Note:** Local dev uses SQLite by default. Redis is optional — if unavailable, the system runs without caching (logs a warning but continues normally).
+> Uses SQLite locally (auto-created as `iasw.db`). No PostgreSQL or Redis needed.
 
 ---
 
-## 🎬 Demo Walkthrough
+## 📋 Demo Walkthrough
 
-### Step 1 — Staff submits a change request
+### End-to-End Legal Name Change Flow
 
-1. Open `http://localhost:5173` (dev) or `http://localhost:3000` (Docker prod)
-2. Use one of the valid test customers:
+**Step 1 — Login as Staff User**
+- Open `http://localhost:5173`
+- Login with `user / user123`
 
-| Customer ID | Current Name | Use as "Old Name" |
-|-------------|-------------|-------------------|
-| `C001` | Priya Sharma | Legal Name Change |
-| `C002` | Rahul Verma | Legal Name Change |
-| `C003` | Meena Iyer | Legal Name Change |
+**Step 2 — Submit an Intake Request**
+- Customer ID: `C001` (Priya Sharma)
+- Change Type: `Legal Name Change`
+- Current Name: `Priya Sharma`
+- New Name: `Priya Mehta`
+- Upload: A marriage certificate image
+- Click **Submit** — system returns a Task ID immediately (`202 Accepted`)
+- The UI polls the task status every second
 
-3. Upload any image (JPG/PNG) or PDF as the supporting document
-4. Click **Submit to AI Document Processor**
-5. Watch the live progress bar: `QUEUED → RUNNING → COMPLETED`
+**Step 3 — AI Pipeline runs (~5–10 seconds)**
 
-### Step 2 — Checker reviews and decides
+```
+Agent 1: Validation Agent
+  ├─ Looks up C001 in rps_records table → name = "Priya Sharma" ✓
+  └─ Matches submitted old_value → PASSED
 
-1. Open `http://localhost:5173/checker` or `http://localhost:3000/checker` (or click Checker tab)
-2. The pending request appears in the queue with AI summary, confidence scores, and forgery check result
-3. Enter Checker ID (e.g. `checker_sup_01`) and click **Approve** or **Reject**
-4. The request moves to `APPROVED` / `REJECTED` and the mock RPS is updated
+Agent 2: Document Processor
+  ├─ is_valid_document check: Is this actually a document? (not a selfie)
+  ├─ Gemini 2.5 Flash Vision → extracts bride_name, married_name, issue_date
+  ├─ Code-level forgery checks (magic bytes, EXIF, PDF metadata)
+  └─ Gemini dedicated forgery analysis (tamper signal breakdown)
 
-### Step 3 — Verify
+Agent 3: Confidence Scorer
+  ├─ Priority 0: Selfie/screenshot guard (hard REJECT if not a document)
+  ├─ Fuzzy name match (old + new, weakest-link scoring)
+  ├─ Authenticity score (extraction confidence + forgery verdict)
+  └─ Recommendation: APPROVE / FLAG / REJECT
+```
 
+**Step 4 — Login as Admin (Checker)**
+- Logout → Login with `admin / admin123`
+- Go to **Checker Queue**
+- Review the AI summary, confidence scores, document type, forgery signals
+- Click **Approve** or **Reject** with optional notes
+
+**Step 5 — RPS Write (on Approval)**
+- Only if Checker clicks Approve does `POST /api/rps/write` fire
+- The `rps_records` table is updated with the new name
+- An immutable audit log entry is written
+
+---
+
+## 🗄 Database Schema (5 Tables)
+
+```sql
+-- Core banking mock data
+rps_records          (customer_id PK, name, dob, address, phone, email)
+
+-- Change request lifecycle
+pending_requests     (id PK, customer_id, change_type, old_value, new_value,
+                      extracted_value, document_type, filenet_ref_id,
+                      confidence_name, confidence_authenticity, forgery_check,
+                      ai_summary, ai_recommendation, overall_status,
+                      checker_id, checker_decision, checker_notes,
+                      created_at, updated_at, decided_at)
+
+-- Immutable audit trail
+audit_log            (id PK, request_id FK, actor, action, detail JSON, created_at)
+
+-- Authentication
+users                (id PK, username UNIQUE, password_hash, role, active, created_at, approved_by)
+user_registrations   (id PK, username UNIQUE, password_hash, requested_role,
+                      status, decision_by, decision_at, decision_notes, created_at)
+```
+
+**View any table:**
 ```bash
-# View current mock RPS state
-curl http://localhost:8000/api/rps/state
+docker compose exec db psql -U postgres -d iasw_db -c "SELECT * FROM rps_records;"
+docker compose exec db psql -U postgres -d iasw_db -c "SELECT id, customer_id, overall_status, ai_recommendation FROM pending_requests;"
+docker compose exec db psql -U postgres -d iasw_db -c "SELECT username, role, active FROM users;"
+```
 
-# View audit trail for a specific request
-curl http://localhost:8000/api/checker/audit/{request_id}
+---
+
+## 🤖 AI Stack
+
+| Component | Technology | Purpose |
+|-----------|-----------|---------|
+| Orchestration | LangGraph | Stateful 3-node agent pipeline |
+| Vision / OCR | Gemini 2.5 Flash | Document field extraction |
+| Forgery (visual) | Gemini 2.5 Flash | Dedicated tamper signal analysis |
+| Forgery (code) | Custom heuristics | Magic bytes, EXIF, PDF metadata |
+| Name matching | FuzzyWuzzy | Token-sort-ratio, OCR-tolerant |
+| Document guard | Gemini + rule | `is_valid_document` check (rejects selfies) |
+
+---
+
+## 🔐 Authentication & Roles
+
+| Endpoint | Access |
+|----------|--------|
+| `POST /api/auth/login` | Public |
+| `POST /api/auth/register` | Public (pending admin approval) |
+| `GET /api/auth/me` | Any authenticated user |
+| `GET /api/auth/registrations` | ADMIN only |
+| `POST /api/checker/decide` | ADMIN only |
+| `GET /api/checker/queue` | ADMIN only |
+| `POST /api/intake` | Any authenticated USER |
+| `POST /api/rps/write` | System (gated by checker_decision) |
+
+---
+
+## 🛡 HITL Boundary — 3 Layers
+
+```
+Layer 1: Graph    — No write node in LangGraph pipeline. AI cannot commit.
+Layer 2: API      — POST /api/rps/write validates checker_id + APPROVED status.
+Layer 3: Database — CHECK constraint: checker_id must be non-null for APPROVED rows.
 ```
 
 ---
@@ -181,362 +249,81 @@ curl http://localhost:8000/api/checker/audit/{request_id}
 ## 📁 Project Structure
 
 ```
-.
 ├── app/
-│   ├── main.py                    # FastAPI app + lifespan + rate limiter setup
-│   ├── config.py                  # Settings (env vars, mock RPS seed data)
-│   ├── database.py                # SQLAlchemy schema: PendingRequest + AuditLog
-│   ├── models.py                  # Pydantic request/response schemas
-│   │
 │   ├── agents/
-│   │   ├── graph.py               # LangGraph 4-node state machine
-│   │   ├── validation_agent.py    # Agent 1: RPS customer + value cross-check
-│   │   ├── document_processor.py  # Agent 2: Gemini extraction + dedicated forgery analysis
-│   │   └── confidence_scorer.py   # Agent 3: Fuzzy match + 5-priority scoring
-│   │
+│   │   ├── graph.py              # LangGraph state machine
+│   │   ├── validation_agent.py   # Agent 1: RPS cross-check (DB-backed)
+│   │   ├── document_processor.py # Agent 2: Gemini OCR + forgery
+│   │   └── confidence_scorer.py  # Agent 3: Scoring + recommendation
 │   ├── routers/
-│   │   ├── intake.py              # POST /api/intake (202 async + duplicate guard)
-│   │   ├── checker.py             # GET/POST /api/checker/* (Redis-cached queue)
-│   │   └── rps.py                 # Mock RPS write + state viewer (HITL gated)
-│   │
-│   └── services/
-│       ├── async_tasks.py         # Background task manager (thread pool executor)
-│       ├── cache.py               # Redis cache manager (get/set/invalidate)
-│       ├── forgery_checks.py      # Deterministic forgery signals (magic bytes, PDF/EXIF metadata, hygiene)
-│       ├── rate_limiter.py        # SlowAPI limiter singleton
-│       ├── retry_utils.py         # Exponential backoff + circuit breaker (Gemini)
-│       ├── filenet_mock.py        # Document archival (local filesystem mock)
-│       └── observability.py       # structlog setup + DB audit trail
-│
-├── frontend/                      # React 18 + Vite
-│   ├── src/
-│   │   ├── pages/
-│   │   │   ├── Intake.jsx         # Staff submission form + async polling
-│   │   │   ├── Checker.jsx        # Checker queue + decision modal
-│   │   │   └── Dashboard.jsx      # System overview stats
-│   │   ├── App.jsx
-│   │   └── index.css
-│   ├── package.json
-│   └── vite.config.js
-│
-├── k8s/
-│   ├── frontend.yaml              # Kubernetes Deployment + Service for frontend
-│   ├── frontend.Dockerfile        # Multi-stage build: Node 20 → nginx:alpine
-│   └── nginx.conf                 # SPA routing + security headers + gzip
-│
-├── tests/
-│   ├── test_intake.py
-│   └── test_checker.py
-│
-├── logs/                          # Structured JSON logs (auto-created)
-├── uploads/                       # Mock FileNet store (auto-created)
-├── docker-compose.yml             # Backend + PostgreSQL + Redis
-├── Dockerfile                     # Multi-stage Python backend image
+│   │   ├── auth.py               # Login, register, user management
+│   │   ├── intake.py             # Async intake (202 + task poll)
+│   │   ├── checker.py            # HITL decision endpoint
+│   │   └── rps.py                # RPS write (HITL gated)
+│   ├── services/
+│   │   ├── auth.py               # JWT, bcrypt, seed users
+│   │   ├── cache.py              # Redis cache manager
+│   │   ├── forgery_checks.py     # Code-level forgery heuristics
+│   │   ├── async_tasks.py        # Background task manager
+│   │   └── observability.py      # structlog JSON logging
+│   ├── database.py               # SQLAlchemy models (5 tables)
+│   ├── config.py                 # Centralised settings
+│   └── main.py                   # FastAPI app + startup hooks
+├── frontend/
+│   └── src/
+│       ├── auth/                 # AuthContext, ProtectedRoute
+│       ├── pages/
+│       │   ├── Login.jsx         # Login page
+│       │   ├── Register.jsx      # Self-serve registration
+│       │   ├── Intake.jsx        # Staff submission form
+│       │   ├── Checker.jsx       # Admin review dashboard
+│       │   └── Registrations.jsx # Admin registration queue
+│       └── api.js                # Axios API client (JWT headers)
+├── k8s/                          # Kubernetes manifests (GKE-ready)
+├── docker-compose.yml            # Full stack (db + redis + backend + frontend)
+├── Dockerfile                    # Backend production image
+├── k8s/frontend.Dockerfile       # Frontend nginx production image
 ├── requirements.txt
-├── .env.example
-├── DEPLOYMENT.md                  # Docker + k8s deployment guide
-└── README.md
+├── .env.example                  # Template (copy to .env, never commit .env)
+├── README.md                     # This file
+├── DEPLOYMENT.md                 # Docker + Kubernetes deployment guide
+└── SOLUTION_DESIGN.md            # Full technical submission document
 ```
 
 ---
 
-## ⚙️ Tech Stack
+## 🔧 Environment Variables
 
-| Layer | Tool | Version | Why |
-|-------|------|---------|-----|
-| **Orchestration** | LangGraph | 1.1.9 | Graph-based state machine with typed `WorkflowState`, conditional routing, natural HITL pause point |
-| **LLM / OCR** | Gemini 1.5 Flash | via `langchain-google-genai` | Multimodal (vision + text) in one API call. Falls back to mock mode if key absent |
-| **Backend** | FastAPI + Uvicorn | 0.136.1 / 0.46.0 | Async Python, auto OpenAPI docs, dependency injection |
-| **Database** | SQLite (dev) / PostgreSQL (prod) | SQLAlchemy 2.0 | Zero-setup locally; swap `DATABASE_URL` to migrate |
-| **Frontend** | React 18 + Vite | — | Live polling UI, async progress bar, hot-reload dev |
-| **Caching** | Redis | 5.0.1 | Checker queue cached with 30s TTL; auto-invalidated on decision |
-| **Rate Limiting** | SlowAPI | 0.1.9 | 10 req/min per IP on `POST /api/intake` |
-| **Resilience** | Tenacity | 8.2.3 | Exponential backoff + circuit breaker on all Gemini API calls |
-| **Fuzzy Matching** | fuzzywuzzy + python-Levenshtein | 0.18.0 / 0.27.1 | Handles OCR artefacts (casing, spacing) in name comparison |
-| **Observability** | structlog | 25.5.0 | Structured JSON logs; every agent step written to `AuditLog` table |
-| **Containers** | Docker Compose + k8s | — | Full backend stack containerised; k8s manifest for frontend |
-
----
-
-## 🔒 Security & HITL Enforcement
-
-### Human-in-the-Loop — three independent enforcement layers
-
-1. **Graph layer** — The LangGraph pipeline terminates at `stage_to_pending`. No RPS write node exists in the graph — the AI pipeline physically cannot trigger a write.
-2. **API layer** — `POST /api/rps/write` checks `checker_decision` status in the DB before executing. No `checker_id` → no write.
-3. **DB layer** — `checker_id IS NOT NULL` enforced before status can advance from `AI_VERIFIED_PENDING_HUMAN`.
-
-### Duplicate submission guard
-
-If a customer already has an open request of the same `change_type` awaiting Checker review, any new submission returns:
-
-```json
-HTTP 409 Conflict
-{
-  "detail": "Customer 'C001' already has an open LEGAL_NAME_CHANGE request
-             (request_id: ...) awaiting Checker review.
-             No new requests can be submitted until that request is approved or rejected."
-}
-```
-
-The guard blocks on **`customer_id + change_type`** — requesting a different new name does not bypass it.
-
-### Data privacy in validation errors
-
-When an old-value mismatch is detected, the error message does **not** reveal the actual value on record:
-
-```
-✅ Safe:  "The current value submitted for customer 'C001' does not match what is on record."
-❌ Unsafe: "Submitted 'Wrong Name' does not match RPS record 'Priya Sharma'."  ← old behaviour
-```
-
-The real value is logged internally in the audit trail for bank staff investigations only.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GEMINI_API_KEY` | (blank = mock mode) | Google AI Studio key |
+| `GEMINI_MODEL` | `gemini-2.5-flash-preview-04-17` | Model for OCR + forgery |
+| `GEMINI_STRICT` | `false` | Fail instead of falling back to mock |
+| `DATABASE_URL` | `sqlite:///./iasw.db` | SQLite (local) or PostgreSQL (Docker) |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection |
+| `JWT_SECRET` | (unsafe default) | **Change in production** |
+| `JWT_EXPIRE_MINUTES` | `60` | Token TTL |
+| `SEED_ADMIN_USERNAME` | `admin` | Default admin username |
+| `SEED_ADMIN_PASSWORD` | `admin123` | Default admin password |
+| `SEED_USER_USERNAME` | `user` | Default user username |
+| `SEED_USER_PASSWORD` | `user123` | Default user password |
+| `APPROVE_THRESHOLD` | `0.80` | Auto-approve confidence threshold |
+| `FLAG_THRESHOLD` | `0.60` | Human review threshold |
+| `RATE_LIMIT` | `10/minute` | Intake rate limit per IP |
 
 ---
 
-## 🌐 LLM Modes
+## 📜 Logs
 
-| Mode | Trigger | Behaviour |
-|------|---------|-----------|
-| **Gemini (real)** | `GEMINI_API_KEY` set in `.env` | Calls Gemini 1.5 Flash multimodal API for real document OCR + forgery detection |
-| **Mock mode** | `GEMINI_API_KEY` blank | Returns realistic hardcoded extraction results — full flow works without internet |
-| **Fallback** | Key set but API call fails | Logs `LLM_FALLBACK_TO_MOCK` warning, degrades gracefully to mock |
-| **Strict mode** | `GEMINI_STRICT=true` | Disables fallback — pipeline errors instead of silently degrading (useful for demos) |
-
-### Verifying Gemini is actually being called
+| File | Contents |
+|------|---------|
+| `logs/iasw.log` | Structured JSON — all agent steps, API calls, errors |
+| `logs/redis.log` | Cache hit/miss/invalidation events |
 
 ```bash
-# 1. Health check — shows current mode
-curl http://localhost:8000/health
-# → {"llm_mode": "gemini", ...}
+# Follow logs live:
+docker compose logs backend -f
 
-# 2. Gemini self-test
-curl http://localhost:8000/api/llm/self-test
-# → {"ok": true, "mode": "gemini", "model": "gemini-1.5-flash"}
-
-# 3. Confirm no fallback in logs
-grep "LLM_FALLBACK_TO_MOCK" logs/iasw.log   # should return nothing
-grep "GEMINI_EXTRACTION_SUCCESS" logs/iasw.log  # should have entries
+# Or tail the log file:
+tail -f logs/iasw.log | python3 -m json.tool
 ```
-
----
-
-## 🛡 Forgery Detection Pipeline
-
-Forgery assessment runs in three layers, and the final `forgery_check` verdict is the most severe of all three:
-
-### Layer 1 — Deterministic code checks (`app/services/forgery_checks.py`)
-
-Pure Python, no LLM. Runs on every upload, produces structured per-signal output:
-
-| Check | Severity | What it catches |
-|---|---|---|
-| File hygiene (empty, oversized, double-extension) | `critical` | Broken or adversarial uploads, `.pdf.exe` smuggling |
-| Magic-byte validation | `critical` | Extension-vs-content mismatch (`.jpg` with non-JPEG bytes) |
-| Suspiciously small file | `warn` | Re-compressed low-quality fakes |
-| PDF metadata — modified before created | `critical` | Tampering (impossible timestamps) |
-| PDF metadata — future creation date | `critical` | Fabricated documents |
-| PDF metadata — edited by Acrobat Pro / Foxit / Illustrator / etc. | `warn` | Non-native editing of documents meant to be scans |
-| PDF metadata — edited days after creation | `warn` | Re-saved edits |
-| Image EXIF — future timestamp | `critical` | Impossible capture time |
-| Image EXIF — edited by Photoshop / GIMP / Lightroom / etc. | `warn` | Documents processed through image editors |
-| Image EXIF — phone-camera origin | `info` | Phone-captured "official" documents (advisory only) |
-
-### Layer 2 — Dedicated Gemini forgery analysis
-
-A second Gemini call whose only job is tamper assessment. It returns structured per-signal output (text alignment, font consistency, local recompression, seal geometry, paper texture vs flat render, compression uniformity, AI-generation indicators, specimen/sample watermark detection) plus an overall 0–10 risk score and verdict. Critical signals (specimen watermark, AI generation, high overall risk) map to `FAIL`; soft signals map to `WARN`.
-
-Keeping forgery analysis separate from field extraction materially improves both — one focused prompt per job.
-
-### Layer 3 — Combined verdict + Checker-facing reasoning
-
-Code and Gemini signals are merged; the final verdict is the most severe of the two layers. The full signal list is written to the audit trail. When the verdict is `WARN` or `FAIL`, the top signals and Gemini's reasoning are surfaced directly in the Checker Review UI — the human sees *why* a request was flagged, not just a label.
-
-### Degradation behaviour
-
-- Gemini key missing → mock-mode clean analysis (advisory only)
-- Gemini forgery call fails with a key set → demoted to `WARN` with a `gemini_forgery_analysis_unavailable` signal (we don't silently pretend all is well)
-- Code checks always run regardless of LLM availability
-
-### Intentional follow-up work (not in this pass)
-
-- Perceptual hashing across the request corpus (duplicate/template-reuse detection)
-- Error Level Analysis for JPEGs (localised tamper heatmap)
-- Dedicated AI-image-generation detectors
-- Issuing-authority API cross-checks for document numbers
-
----
-
-## 📊 Confidence Scoring Logic
-
-The confidence scorer uses a **5-priority decision chain**:
-
-```
-1. forgery_check == FAIL     → REJECT  (reason includes any missing-field info)
-2. forgery_check == WARN     → FLAG    (force human review)
-3. missing required fields   → REJECT
-4. document_type mismatch    → REJECT  (empty detection → FLAG, never silent pass)
-5. threshold-based scoring   → APPROVE (≥ approve_th) / FLAG (≥ flag_th) / REJECT (<flag_th)
-```
-
-**Score formula:**
-```
-overall = (name_match × 0.6) + (authenticity × 0.4)
-
-name_match    = min(old_name_score, new_name_score)          ← WEAKEST-LINK, not average.
-                A correct old name + wrong new name cannot average its way
-                to a pass. Both sides must clear the bar.
-
-authenticity  = (extraction_confidence × 0.4) + (forgery_score × 0.6)
-                where extraction_confidence ∈ {HIGH→0.90, MEDIUM→0.70, LOW→0.45}
-                and   forgery_score         ∈ {PASS→1.00, WARN→0.70, FAIL→0.10}
-```
-
-**Per-change-type thresholds** (via `settings.thresholds_for()`):
-
-| Change type | Approve ≥ | Flag ≥ |
-|---|---|---|
-| `LEGAL_NAME_CHANGE` | **0.85** | **0.65** |
-| _fallback (any other)_ | 0.80 | 0.60 |
-
-The Legal Name Change bar is higher because `min()`-based scoring means **both** old and new name must clear 0.85 — stricter but fairer than averaging.
-
-### AI-vs-Checker agreement tracking
-
-Every Checker decision records whether it matched the AI's recommendation:
-
-- **agree** — Checker confirmed AI's APPROVE or REJECT
-- **disagree** — Checker overrode AI (e.g. AI said APPROVE, Checker rejected)
-- **deferred** — AI said FLAG; Checker's decision is the authoritative call
-- **unknown** — no AI recommendation recorded
-
-Stats are exposed via `GET /api/checker/agreement-stats` for threshold calibration:
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" \
-     http://localhost:8000/api/checker/agreement-stats
-```
-
-Use the output to calibrate thresholds:
-- High `disagree` on APPROVE recommendations → raise the approve threshold
-- High `disagree` on REJECT recommendations → lower the flag threshold
-
-### What the Checker sees in the summary
-
-The Checker UI shows overall confidence, per-field breakdown (old-name vs bride-name, new-name vs married-name), authenticity score, forgery verdict, and the AI recommendation. When forgery is WARN or FAIL, the top forgery signals and Gemini's reasoning are surfaced inline so the human sees *why* to look closer.
-
-The Checker always has final authority regardless of AI recommendation.
-
-### Intentional follow-up work (not in this pass)
-
-- Hard-reject vs advisory-reject split (saves Checker time for obvious junk)
-- Cross-field consistency rules (issue-date sanity, authority plausibility)
-- Velocity / pattern anomaly scoring across the request corpus
-
----
-
-## 🔄 Async Pipeline Flow
-
-```
-POST /api/intake
-    │
-    ├── Duplicate guard (DB check: customer + change_type + AI_VERIFIED_PENDING_HUMAN)
-    │   └── 409 Conflict if already pending
-    │
-    ├── File validation (size ≤ 20MB, non-empty)
-    │
-    ├── Write temp file
-    │
-    ├── Return 202 Accepted { task_id, poll_url }
-    │
-    └── asyncio.create_task → ThreadPoolExecutor
-            │  (event loop stays free for poll requests)
-            ▼
-        run_iasw_pipeline()     ← synchronous, runs in worker thread
-            │
-            ├── Agent 1: Validation
-            ├── Agent 2: Document Processing (Gemini)
-            ├── Agent 3: Confidence Scoring
-            └── Stage to DB → AI_VERIFIED_PENDING_HUMAN
-
-GET /api/tasks/{task_id}       ← responds in <55ms while pipeline runs
-    └── { status: QUEUED | RUNNING | COMPLETED | FAILED }
-```
-
----
-
-## 📋 Database Schema
-
-### `pending_requests`
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | UUID v4 |
-| `customer_id` | TEXT | Bank customer identifier |
-| `change_type` | TEXT | `LEGAL_NAME_CHANGE` (only supported change type in this prototype) |
-| `old_value` | TEXT | Current value as stored in RPS |
-| `new_value` | TEXT | Requested new value |
-| `extracted_value` | TEXT | AI-extracted value from document |
-| `document_type` | TEXT | Declared document type |
-| `filenet_ref_id` | TEXT | Mock FileNet archive reference |
-| `confidence_name` | REAL | Name match score (0.0–1.0) |
-| `confidence_authenticity` | REAL | Document authenticity score (0.0–1.0) |
-| `forgery_check` | TEXT | `PASS` \| `WARN` \| `FAIL` |
-| `ai_summary` | TEXT | Human-readable summary for Checker |
-| `ai_recommendation` | TEXT | `APPROVE` \| `FLAG` \| `REJECT` |
-| `overall_status` | TEXT | `AI_VERIFIED_PENDING_HUMAN` \| `APPROVED` \| `REJECTED` \| `VALIDATION_FAILED` |
-| `checker_id` | TEXT | Mandatory before any status change |
-| `checker_decision` | TEXT | `APPROVED` \| `REJECTED` |
-| `checker_notes` | TEXT | Optional notes |
-| `created_at` | TIMESTAMP | |
-| `updated_at` | TIMESTAMP | |
-| `decided_at` | TIMESTAMP | |
-
-### `audit_log`
-
-Every agent step and checker decision is written here with `request_id`, `stage`, `actor`, `action`, and `metadata`.
-
----
-
-## 🔍 Observability
-
-| Signal | Location | How to access |
-|--------|----------|---------------|
-| Structured logs | `logs/iasw.log` | JSON, one line per agent step |
-| Audit trail | `audit_log` DB table | `GET /api/checker/audit/{request_id}` |
-| Health + cache | `/health` | `{"status":"ok","cache":"connected"}` |
-| RPS state | `/api/rps/state` | Current mock RPS values for all customers |
-| API docs | `/docs` | Swagger UI with all endpoints |
-
----
-
-## 🧪 Running Tests
-
-```bash
-source venv/bin/activate
-pytest tests/ -v
-```
-
----
-
-## 🌍 Deployment
-
-See [DEPLOYMENT.md](./DEPLOYMENT.md) for:
-- Docker Compose production configuration
-- Kubernetes manifests (`k8s/frontend.yaml`)
-- Environment variable reference
-- PostgreSQL migration from SQLite
-
----
-
-## 🏦 Mock RPS Customers
-
-| Customer ID | Name | Phone | Address |
-|-------------|------|-------|---------|
-| `C001` | Priya Sharma | 9876543210 | 12 MG Road, Mumbai |
-| `C002` | Rahul Verma | 9123456789 | 45 Park Street, Delhi |
-| `C003` | Meena Iyer | 9988776655 | 8 Anna Salai, Chennai |
-
----
-
-*Stack: Python · FastAPI · LangGraph · Gemini 1.5 Flash · React 18 · PostgreSQL · Redis · Docker*

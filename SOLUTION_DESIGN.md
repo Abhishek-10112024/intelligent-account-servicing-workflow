@@ -1,360 +1,344 @@
-# Solution Design and Implementation
+# Solution Design & Implementation
 ## Intelligent Account Servicing Workflow (IASW)
-### AI Product Engineer — Technical Assignment Submission
+### AI Product Engineer — Technical Assessment
 
 ---
 
 ## 1. Executive Summary
 
-This submission presents a fully functional, production-grade prototype of the Intelligent Account Servicing Workflow (IASW) — an agentic AI system that automates document verification for bank account change requests while enforcing a strict Human-in-the-Loop (HITL) Checker requirement before any data is committed to the core banking system.
+The Intelligent Account Servicing Workflow (IASW) is a production-grade agentic AI system that automates document verification and data validation for bank account change requests, while strictly enforcing a Human-in-the-Loop (HITL) Checker boundary before any write is committed to the core banking system.
 
-**What was built:**
-- A staff intake form where employees submit change requests and upload supporting documents
-- A 3-node LangGraph agent pipeline: Validation → Document Extraction (Gemini Vision) → Confidence Scoring
-- A Checker Review UI where supervisors see the AI analysis and make the final APPROVE/REJECT decision
-- A mock RPS write that executes only upon human Checker approval
-- Full observability: structured JSON logs + immutable database audit trail
+The prototype delivers a complete, end-to-end Legal Name Change flow:
 
-**Key design principle:** The AI pipeline assists and recommends — it never approves autonomously. HITL is enforced at three independent layers (graph, API, database) so it cannot be bypassed.
+1. **Staff** submits a change request with supporting documentation via a React UI
+2. **Three LangGraph agents** validate the customer, extract document fields using Gemini 2.5 Flash Vision, and compute a confidence score with forgery analysis
+3. **A Checker (Admin)** reviews the AI output and makes the final approve/reject decision
+4. **Only on approval** does the system write to the mock RPS (core banking record)
 
-**Live system evidence:** The PostgreSQL database currently holds 54 processed requests and 236 audit log entries from real end-to-end testing.
+All actions are immutably logged to an audit trail in PostgreSQL, satisfying banking regulatory traceability requirements.
 
 ---
 
 ## 2. Problem Understanding & Scope
 
-### The Problem
+### Challenge
+Banks process thousands of account change requests daily. Manual document verification is slow, error-prone, and creates compliance risk. The goal is to automate the verification pipeline while keeping a human in the loop for final decisions — a non-negotiable requirement in regulated financial services.
 
-Core banking account changes require document verification — a slow, manual, error-prone process. Staff must read a document, extract fields, compare them to the request, and escalate to a supervisor. This creates:
-- Processing delays (hours to days per request)
-- Inconsistent verification quality across staff
-- Incomplete audit trails for regulatory compliance
-- No structured confidence assessment
+### Scope (This Prototype)
+- **Change type supported:** Legal Name Change (marriage certificate, gazette notification, deed poll)
+- **Supported customers:** C001 (Priya Sharma), C002 (Rahul Verma), C003 (Anita Nair)
+- **HITL:** Enforced at three independent layers (graph, API, database)
+- **Auth:** JWT-based login, role separation (ADMIN / USER), admin-approved registration flow
 
-### Scope of This Prototype
-
-| In Scope | Out of Scope |
-|----------|-------------|
-| Legal Name Change (end-to-end) | Real FileNet integration |
-| Marriage Certificate verification | Real RPS/core banking write |
-| AI extraction + confidence scoring | Authentication/JWT |
-| HITL Checker UI with approve/reject | Multi-tenant setup |
-| Immutable audit trail | Additional change types (explicitly out of scope; rejected at intake) |
-| Docker containerization + k8s manifests | Mobile UI |
+### Out of Scope (Production Extensions)
+- Address change, phone change, KYC update flows
+- Real RPS integration (replaced by `rps_records` PostgreSQL table)
+- Real FileNet integration (replaced by `uploads/` directory)
+- Production SSO / Identity Provider
+- Pixel-level forensic tamper detection
 
 ---
 
 ## 3. Solution Architecture
 
-### 3a. System Architecture Diagram
+### 3a. System Diagram
 
 ```mermaid
 flowchart TD
-    subgraph Frontend["React Frontend (Vite · port 5173 / 3000)"]
-        SF["Staff Intake Form\nCustomer ID · Old Name · New Name · Document Upload"]
-        CU["Checker Review UI\nAI Summary · Scores · Document Preview · Approve/Reject"]
+    subgraph FE["React Frontend (port 5173)"]
+        LG["🔐 Login / Register"]
+        SF["📋 Staff Intake Form"]
+        CU["🔍 Checker Review UI"]
+        RG["👥 Registration Queue"]
     end
 
-    subgraph Backend["FastAPI Backend (Uvicorn · port 8000)"]
-        API1["POST /api/intake\n202 Accepted + task_id\nRate limited: 10/min/IP"]
-        API2["GET /api/tasks/{id}\nAsync poll endpoint"]
-        API3["GET /api/checker/queue\nRedis cached · 30s TTL"]
-        API4["POST /api/checker/decide\n⚠️ HITL BOUNDARY"]
-        API5["POST /api/rps/write\nGated by checker_decision"]
+    subgraph BE["FastAPI Backend (port 8000)"]
+        AU["/api/auth/*\nJWT · bcrypt · role guard"]
+        I["/api/intake\n202 Accepted + task_id\n10 req/min rate limit"]
+        T["/api/tasks/{id}\nAsync poll"]
+        Q["/api/checker/queue\nRedis cached TTL 30s"]
+        D["/api/checker/decide\n🛑 HITL BOUNDARY"]
+        R["/api/rps/write\nGated by APPROVED status"]
     end
 
-    subgraph Pipeline["LangGraph Pipeline (Thread Pool Executor)"]
-        A1["Agent 1: Validation\nRPS customer lookup\nOld-value cross-check"]
-        A2["Agent 2: Document Processor\nGemini 1.5 Flash Vision\nOCR + field extraction + forgery heuristic"]
-        A3["Agent 3: Confidence Scorer\nFuzzy name match\n5-priority decision chain\nAI summary generation"]
-        STAGE["Stage to Pending Table\nStatus: AI_VERIFIED_PENDING_HUMAN"]
+    subgraph LGP["LangGraph Pipeline"]
+        A1["Agent 1: Validation\nDB RPS lookup"]
+        A2["Agent 2: Document Processor\nGemini 2.5 Flash Vision\nCode + AI forgery analysis"]
+        A3["Agent 3: Confidence Scorer\nPriority 0: document guard\nFuzzy name match\nRecommendation engine"]
     end
 
-    subgraph Storage["Persistence Layer"]
-        PG[("PostgreSQL\npending_requests\naudit_log")]
-        RD[("Redis\nChecker queue cache\nTTL = 30s")]
-        FS["Local Filesystem\nMock FileNet Store"]
+    subgraph DB["PostgreSQL"]
+        T1["rps_records"]
+        T2["pending_requests"]
+        T3["audit_log"]
+        T4["users"]
+        T5["user_registrations"]
     end
 
-    SF -->|"multipart/form-data"| API1
-    API1 -->|"asyncio.create_task"| Pipeline
-    API1 -->|"202 + task_id"| SF
-    SF -->|"poll every 1s"| API2
-    CU -->|"poll queue"| API3
-    CU -->|"checker_id + decision"| API4
-    A1 --> A2 --> A3 --> STAGE
-    STAGE -->|"DB write"| PG
-    A2 -->|"archive document"| FS
-    API3 --> RD
-    API4 -->|"update record"| PG
-    API4 -->|"invalidate cache"| RD
-    API4 --> API5
-    API5 -->|"mock RPS update ONLY if APPROVED"| PG
+    RD[("Redis\nQueue cache")]
 
-    style API4 fill:#ff6b6b,color:#fff
-    style STAGE fill:#ffa94d,color:#fff
+    SF --> I --> A1 --> A2 --> A3 --> T2
+    D --> T2 & T3 & RD
+    D --> R --> T1
+    Q --> RD
+    AU --> T4 & T5
+
+    style D fill:#ff6b6b,color:#fff
 ```
-
-**Sync vs Async Boundaries:**
-
-| Segment | Type | Reason |
-|---------|------|--------|
-| POST /api/intake → Pipeline | **Async** (202 + poll) | Gemini calls take 3–10s; blocking freezes the UI |
-| Agent 1 → 2 → 3 | **Sync** (within thread) | LangGraph runs in a dedicated thread pool worker |
-| GET /api/tasks/{id} | **Sync** (in-memory) | Sub-millisecond lookup; no I/O |
-| POST /api/checker/decide | **Sync** | Immediate DB write; human decision |
-| Redis reads | **Async** | Non-blocking I/O for cache hits |
-
----
 
 ### 3b. Agent Design
 
-| Component | Responsibility | Input | Output |
-|-----------|---------------|-------|--------|
-| **Validation Agent** | Verify customer exists in mock RPS; check submitted old_value matches record; block if duplicate pending request exists | `customer_id`, `change_type`, `old_value` | `{valid, customer_found, mismatch_fields, error}` |
-| **Document Processor** | Send document image to Gemini 1.5 Flash Vision; parse JSON extraction; archive to mock FileNet; apply forgery heuristic | Document file path, `change_type`, `document_type` | `{document_type_detected, bride_name, married_name, extraction_confidence, forgery_status, filenet_ref_id}` |
-| **Confidence Scorer** | Compare extracted fields to requested values via fuzzy matching; compute per-field + overall scores; run 5-priority recommendation logic; generate human-readable summary | `extracted_fields`, `old_value`, `new_value`, `forgery_check` | `{name_match, authenticity, overall_confidence, recommendation, summary, field_scores}` |
-| **Summary Agent** | *(Integrated into Confidence Scorer)* Generate natural language summary for Checker UI | Score card + document metadata | `ai_summary` string displayed in Checker UI |
-| **Staging Node** | Write completed verification to `pending_requests`; write all agent steps to `audit_log` | Full `IASWState` | DB row + task marked COMPLETED |
+| Agent | Inputs | Processing | Outputs |
+|-------|--------|-----------|---------|
+| **Agent 1: Validation** | customer_id, old_value, change_type | Query `rps_records` DB → compare old_value | ValidationResult (pass/fail + RPS value) |
+| **Agent 2: Document Processor** | File path, change_type, document_type | 1. `is_valid_document` check (rejects selfies) 2. Gemini extraction prompt 3. Code-level forgery (magic bytes, EXIF, PDF metadata) 4. Gemini dedicated forgery analysis | extracted_fields, forgery_check (PASS/WARN/FAIL), forgery_signals, filenet_ref |
+| **Agent 3: Confidence Scorer** | extracted_fields, old/new values, forgery result | Priority 0: non-document guard → Fuzzy match (weakest-link) → Authenticity score → 5-priority recommendation chain | ConfidenceScoreCard: name_match, authenticity, overall_confidence, recommendation, ai_summary |
 
-**LangGraph State (typed dict flowing through all nodes):**
-```python
-class IASWState(TypedDict):
-    customer_id: str       # From intake form
-    change_type: str
-    old_value: str
-    new_value: str
-    document_type: str
-    file_path: str
-    validation_result: dict    # Filled by Agent 1
-    extracted_fields: dict     # Filled by Agent 2
-    filenet_ref_id: str
-    forgery_check: str
-    confidence_score_card: dict  # Filled by Agent 3
-    overall_status: str
-    request_id: str
-```
+### 3c. Key Prompt Engineering Decisions
 
-**Gemini Prompt Design (Document Processor):**
-
-The prompt is structured for deterministic JSON output:
-```
-You are a document verification agent for a bank.
-Analyze the provided document image and extract the following fields.
-Return ONLY valid JSON with exactly these keys:
-{
-  "document_type_detected": "<Marriage Certificate|Gazette Notification|Deed Poll|Other/Screenshot>",
-  "bride_name": "<name as written on document>",
-  "married_name": "<married name as written>",
-  "issue_date": "<DD-MM-YYYY>",
-  "issuing_authority": "<authority name>",
-  "document_number": "<reference if visible>",
-  "is_legible": <true|false>,
-  "extraction_confidence": "<HIGH|MEDIUM|LOW>",
-  "forgery_analysis": "<one line analysis>",
-  "forgery_status": "<PASS|WARN|FAIL>"
-}
-If a field is not visible or not applicable, use null.
-Do not add any text outside the JSON object.
-```
-
-Key design decisions:
-- **Strict JSON output** — prevents hallucinated narrative that breaks parsing
-- **null for missing fields** — distinguishes "not found" from "not applicable"
-- **Self-reported confidence** — drives downstream scoring without a separate classifier
-- **Forgery self-assessment** — first-pass heuristic; catches obvious fakes and degrades confidence
-
----
-
-### 3c. HITL Boundary Design
-
-**What the AI CAN do autonomously:**
-- Extract fields from uploaded documents via Gemini Vision
-- Cross-reference extracted values against requested values
-- Compute per-field and overall confidence scores (0.0–1.0)
-- Generate recommendations: APPROVE / FLAG / REJECT
-- Write to the `pending_requests` staging table (status = `AI_VERIFIED_PENDING_HUMAN`)
-- Write every agent step to the immutable `audit_log`
-
-**What the AI CANNOT do autonomously:**
-- Write to the mock RPS (customer record)
-- Change `overall_status` to APPROVED or REJECTED
-- Act as its own Checker (`checker_id` must be a non-empty human identifier)
-
-**HITL Enforcement — Three Independent Layers:**
+**Extraction Prompt (Agent 2, Call 1):**
+The prompt explicitly instructs Gemini to first determine `is_valid_document` before extracting any fields. If the image is a selfie, screenshot, or non-document image, Gemini returns `is_valid_document: false` and all name fields as `null`. This prevents the confidence scorer from ever receiving extractable data from a non-document, blocking the fuzzy-match exploit.
 
 ```
-Layer 1: Graph Architecture
-  The LangGraph pipeline has NO RPS write node.
-  The graph terminates at "stage_to_pending".
-  There is no code path from AI pipeline → RPS.
+FIRST, determine whether this is actually a legal/official document
+or something else (selfie, screenshot, blank page).
 
-Layer 2: API Enforcement (checker.py)
-  POST /api/checker/decide validates:
-  - checker_id must be non-empty (422 error if blank)
-  - Only AI_VERIFIED_PENDING_HUMAN records can be acted on
-  - RPS write called ONLY if decision == "APPROVED"
-  Code: "AI cannot act as a Checker." is the literal error message.
-
-Layer 3: Database Constraint
-  CONSTRAINT chk_hitl_required CHECK (
-    overall_status IN ('AI_VERIFIED_PENDING_HUMAN', 'VALIDATION_FAILED')
-    OR (checker_id IS NOT NULL AND checker_decision IS NOT NULL)
-  )
-  Meaning: Even raw SQL cannot set status=APPROVED without checker_id.
-  The database itself enforces HITL — independent of all application code.
+is_valid_document: true | false
+document_category: legal_document | personal_photo | screenshot | blank_or_unreadable | other
 ```
 
----
+**Forgery Prompt (Agent 2, Call 2 — dedicated):**
+Splitting extraction and forgery into two separate Gemini calls produces markedly better results. The forgery call uses an adversarial persona ("You are a forensic document examiner") and returns a structured per-signal JSON breakdown rather than a single verdict. This surfaces actionable signals to the human Checker.
 
-### 3d. Data Model
-
-#### `pending_requests` — Central staging table
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | UUID v4 |
-| `customer_id` | TEXT NOT NULL | Bank customer ID (e.g., C001) |
-| `change_type` | TEXT NOT NULL | `LEGAL_NAME_CHANGE` (only supported change type in this prototype) |
-| `old_value` | TEXT | Current value in RPS |
-| `new_value` | TEXT | Requested new value |
-| `extracted_value` | TEXT | AI-extracted value from document |
-| `document_type` | TEXT | e.g., `MARRIAGE_CERTIFICATE` |
-| `filenet_ref_id` | TEXT | Mock FileNet archive ID |
-| `confidence_name` | REAL | Name/value match score (0.0–1.0) |
-| `confidence_authenticity` | REAL | Document authenticity score (0.0–1.0) |
-| `forgery_check` | TEXT | `PASS` \| `WARN` \| `FAIL` |
-| `ai_summary` | TEXT | Human-readable AI summary for Checker UI |
-| `ai_recommendation` | TEXT | `APPROVE` \| `FLAG` \| `REJECT` |
-| `overall_status` | TEXT NOT NULL | `AI_VERIFIED_PENDING_HUMAN` → `APPROVED` \| `REJECTED` \| `VALIDATION_FAILED` |
-| `checker_id` | TEXT | Human checker's staff ID (NULL until reviewed) |
-| `checker_decision` | TEXT | `APPROVED` \| `REJECTED` (NULL until reviewed) |
-| `checker_notes` | TEXT | Optional notes from Checker |
-| `created_at` | TIMESTAMP | Submission time |
-| `updated_at` | TIMESTAMP | Last modification time |
-| `decided_at` | TIMESTAMP | Time of human decision |
-
-#### `audit_log` — Immutable append-only table
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | TEXT PK | UUID v4 |
-| `request_id` | TEXT NOT NULL | FK → pending_requests.id |
-| `actor` | TEXT NOT NULL | `validation_agent` \| `document_processor` \| `confidence_scorer` \| `checker:sup_01` |
-| `action` | TEXT NOT NULL | `VALIDATION_RESULT` \| `DOCUMENT_PROCESSED` \| `CONFIDENCE_SCORED` \| `CHECKER_APPROVED` \| etc. |
-| `detail` | TEXT | JSON payload of the step's full output |
-| `created_at` | TIMESTAMP | Event timestamp |
-
-Rows are **never updated or deleted** — full regulatory compliance audit trail.
-
----
-
-## 4. Technical Stack Justification
-
-| Layer | Chosen Tool | Why |
-|-------|-------------|-----|
-| **Orchestration** | LangGraph 1.1.9 | Graph-based stateful workflow with typed state and conditional routing. Natural HITL pause point at graph termination. Better than raw LangChain for sequential multi-agent pipelines. |
-| **LLM / OCR** | Gemini 1.5 Flash | Natively multimodal — processes document images and text in one API call, no separate OCR pipeline. Falls back to mock mode if API key absent. |
-| **Backend** | FastAPI + Uvicorn | Async-native Python, auto OpenAPI docs at /docs, clean dependency injection for DB sessions. |
-| **Database** | PostgreSQL (prod) / SQLite (dev) | PostgreSQL for concurrent writes, CHECK constraints, ACID compliance. SQLite for zero-setup local dev. Same SQLAlchemy ORM code for both. |
-| **Frontend** | React 18 + Vite | Component-based UI for Staff and Checker views. Async polling pattern fits 202-accepted task model. |
-| **Caching** | Redis 7 | Checker queue cached with 30s TTL. Auto-invalidated on decisions. Gracefully degrades if unavailable. |
-| **Rate Limiting** | SlowAPI | 10 req/min per IP on /api/intake protects against abuse and unbounded Gemini spend. |
-| **Resilience** | Tenacity | Exponential backoff (2s → 4s → 8s) for Gemini API calls. Prevents cascading failures from transient outages. |
-| **Fuzzy Matching** | fuzzywuzzy | `token_sort_ratio` handles OCR artefacts: casing, spacing, word order. "PRIYA SHARMA" vs "Priya Sharma" scores 100. |
-| **Observability** | structlog | Structured JSON logs queryable by field. Every agent step logged to file AND audit_log DB table. |
-| **Containers** | Docker Compose + k8s | Docker Compose for local/demo. Kubernetes manifests (GKE-ready) for production. Multi-stage Dockerfile for minimal image size. |
-
-**Why LangGraph over CrewAI?**
-CrewAI is optimized for collaborative peer-to-peer multi-agent scenarios. IASW has a sequential pipeline (validate → extract → score), making LangGraph's directed graph model the better fit. LangGraph gives explicit control over state and conditional transitions — critical for a regulated workflow where every step must be auditable.
-
-**Why Gemini over GPT-4o?**
-Gemini 1.5 Flash provides native multimodal vision for document images. The mock fallback mode means the prototype works offline without an API key — essential for development and demonstration. Cost-wise, Flash is significantly cheaper than GPT-4o for high-volume document processing.
-
----
-
-## 5. End-to-End Working Flow — Legal Name Change
-
-**Step 1 — Staff submits:**
-Customer ID: C001 | Old Name: Priya Sharma | New Name: Priya Mehta | Document: Marriage Certificate
-
-**Step 2 — 202 Accepted immediately:**
-`{ "task_id": "a4761714-...", "poll_url": "/api/tasks/a4761714-..." }`
-Frontend polls every second showing QUEUED → RUNNING → COMPLETED.
-
-**Step 3 — Agent 1 (Validation):**
-C001 found in RPS. Old value "Priya Sharma" matches record. No duplicate pending request. ✅
-
-**Step 4 — Agent 2 (Gemini Vision extraction):**
-```json
-{ "bride_name": "Priya Sharma", "married_name": "Priya Mehta",
-  "extraction_confidence": "HIGH", "forgery_status": "PASS",
-  "filenet_ref_id": "FN-8849D21C-52E" }
+```
+Be sceptical by default — if you are unsure, say so in the signal
+detail rather than defaulting to PASS.
 ```
 
-**Step 5 — Agent 3 (Confidence Scoring):**
-```
-name_match   = 1.0   (both names match perfectly)
-authenticity = 0.96  (HIGH extraction × 0.4 + PASS forgery × 0.6)
-overall      = 0.984 (1.0 × 0.6 + 0.96 × 0.4)
-recommendation = APPROVE
-```
+### 3d. HITL Boundary Design — 3 Layers
 
-**Step 6 — Pending Table record created:**
-`overall_status = AI_VERIFIED_PENDING_HUMAN`, `checker_id = NULL`
+The HITL boundary is enforced at three independent layers. Bypassing any one layer is insufficient:
 
-**Step 7 — Checker UI shows:**
-> "Marriage Certificate verified. Old name 'Priya Sharma' and new name 'Priya Mehta' were cross-referenced against the extracted document data. Name/Value match confidence: 100%. Document authenticity score: 96%. Forgery check: PASS. Overall confidence: 98%. AI Recommendation: APPROVE."
+| Layer | Mechanism | Enforcement Point |
+|-------|-----------|------------------|
+| **Graph** | No write node exists in the LangGraph pipeline. The pipeline terminates at `AI_VERIFIED_PENDING_HUMAN` status. The AI physically cannot initiate an RPS write. | `app/agents/graph.py` |
+| **API** | `POST /api/rps/write` validates that a valid `checker_id` is present and the record's `checker_decision == 'APPROVED'`. Any attempt without a prior human decision returns 403. | `app/routers/rps.py` |
+| **Database** | `CHECK CONSTRAINT chk_hitl_required`: a row can only advance to `APPROVED` or `REJECTED` status if `checker_id IS NOT NULL AND checker_decision IS NOT NULL`. The database itself refuses invalid state transitions. | `app/database.py` |
 
-**Step 8 — Checker approves:**
-`POST /api/checker/decide` with `checker_id: "checker_sup_01"`, `decision: "APPROVED"`
+**Why 3 layers?** Defence in depth. If there is a bug in the API layer, the DB constraint catches it. If there is a future refactor that adds a write path, the graph layer prevents it from bypassing the API.
 
-**Step 9 — Mock RPS write:**
-`RPS[C001][name]: "Priya Sharma" → "Priya Mehta"` | `rps_updated: true`
+### 3e. Data Model
 
-**Step 10 — Audit trail (real data from running DB):**
-```
-2026-04-27T15:48:17Z | validation_agent    | VALIDATION_RESULT
-2026-04-27T15:49:33Z | document_processor  | DOCUMENT_PROCESSED
-2026-04-27T15:49:33Z | confidence_scorer   | CONFIDENCE_SCORED
-2026-04-27T15:49:33Z | iasw_graph          | STAGED_PENDING_HUMAN
-2026-04-27T15:31:53Z | checker:sup_01      | CHECKER_APPROVED
+```sql
+-- Table 1: RPS Records (mock core banking)
+-- In production: fetched from authenticated RPS REST API
+rps_records (
+    customer_id   VARCHAR PRIMARY KEY,   -- e.g. C001
+    name          VARCHAR NOT NULL,       -- Current legal name
+    dob           VARCHAR,               -- Date of birth
+    address       VARCHAR,
+    phone         VARCHAR,
+    email         VARCHAR,
+    updated_at    TIMESTAMP
+)
+
+-- Table 2: Change Request Staging
+pending_requests (
+    id                      VARCHAR PRIMARY KEY,  -- UUID v4
+    change_type             VARCHAR NOT NULL,      -- LEGAL_NAME_CHANGE
+    customer_id             VARCHAR NOT NULL,
+    old_value               VARCHAR,
+    new_value               VARCHAR,
+    extracted_value         VARCHAR,               -- What AI read from document
+    document_type           VARCHAR,               -- MARRIAGE_CERTIFICATE etc.
+    filenet_ref_id          VARCHAR,               -- Mock FileNet archive ID
+    confidence_name         FLOAT,                 -- 0.0 – 1.0
+    confidence_authenticity FLOAT,                 -- 0.0 – 1.0
+    forgery_check           VARCHAR,               -- PASS / WARN / FAIL
+    ai_summary              TEXT,                  -- Human-readable Checker summary
+    ai_recommendation       VARCHAR,               -- APPROVE / FLAG / REJECT
+    overall_status          VARCHAR NOT NULL,      -- AI_VERIFIED_PENDING_HUMAN / APPROVED / REJECTED
+    checker_id              VARCHAR,               -- Staff ID of deciding Checker
+    checker_decision        VARCHAR,               -- APPROVED / REJECTED
+    checker_notes           TEXT,
+    created_at              TIMESTAMP,
+    updated_at              TIMESTAMP,
+    decided_at              TIMESTAMP,
+    CONSTRAINT chk_hitl_required CHECK (
+        overall_status IN ('AI_VERIFIED_PENDING_HUMAN', 'VALIDATION_FAILED')
+        OR (checker_id IS NOT NULL AND checker_decision IS NOT NULL)
+    )
+)
+
+-- Table 3: Audit Log (immutable, append-only)
+audit_log (
+    id          VARCHAR PRIMARY KEY,
+    request_id  VARCHAR NOT NULL,   -- FK → pending_requests.id
+    actor       VARCHAR NOT NULL,   -- validation_agent / document_processor / checker
+    action      VARCHAR NOT NULL,   -- VALIDATION_PASSED / GEMINI_EXTRACTION_SUCCESS / etc.
+    detail      TEXT,               -- JSON-serialised payload
+    created_at  TIMESTAMP
+)
+
+-- Table 4: Users
+users (
+    id            VARCHAR PRIMARY KEY,
+    username      VARCHAR UNIQUE NOT NULL,
+    password_hash VARCHAR NOT NULL,          -- bcrypt hash (never plaintext)
+    role          VARCHAR NOT NULL,          -- USER | ADMIN
+    active        VARCHAR NOT NULL,          -- "true" | "false"
+    approved_by   VARCHAR,                   -- admin username who approved
+    created_at    TIMESTAMP
+)
+
+-- Table 5: User Registrations (admin-approval queue)
+user_registrations (
+    id              VARCHAR PRIMARY KEY,
+    username        VARCHAR UNIQUE NOT NULL,
+    password_hash   VARCHAR NOT NULL,
+    requested_role  VARCHAR NOT NULL,        -- always USER (server-enforced)
+    status          VARCHAR NOT NULL,        -- PENDING | APPROVED | REJECTED
+    decision_by     VARCHAR,
+    decision_at     TIMESTAMP,
+    decision_notes  TEXT,
+    created_at      TIMESTAMP
+)
 ```
 
 ---
 
-## 6. Assumptions, Constraints & Known Limitations
+## 4. Tech Stack Justification
+
+| Component | Technology | Why |
+|-----------|-----------|-----|
+| **API Framework** | FastAPI | Native async, automatic OpenAPI docs, dependency injection for auth and DB sessions |
+| **Agent Orchestration** | LangGraph | Stateful directed graph with explicit node boundaries — makes HITL enforcement structurally visible and auditable |
+| **AI / Vision** | Gemini 2.5 Flash | Best-in-class multimodal vision for document OCR. Dedicated forgery analysis call produces better signals than combined prompts |
+| **Database** | PostgreSQL + SQLAlchemy | ACID transactions, CHECK constraints for HITL enforcement, full audit trail |
+| **Cache** | Redis | TTL-based checker queue cache (30s). Graceful degradation if unavailable |
+| **Auth** | JWT (HS256) + bcrypt | Stateless tokens, bcrypt for secure password storage, role-based access control |
+| **Async Pattern** | `202 Accepted` + polling | Gemini Vision calls take 5–15s. Returning immediately prevents browser timeouts and enables progress indication |
+| **Name Matching** | FuzzyWuzzy token_sort_ratio | OCR produces capitalisation and spacing artefacts. Fuzzy matching handles "PRIYA SHARMA" == "Priya Sharma" correctly |
+| **Observability** | structlog | Machine-parseable JSON logs with consistent event names — queryable in ELK/Cloud Logging |
+| **Rate Limiting** | slowapi | Protects intake endpoint from abuse (10 req/min per IP) |
+| **Resilience** | tenacity | Exponential backoff for Gemini API calls — handles transient 503s gracefully |
+| **Frontend** | React 18 + Vite | Modern SPA with protected routes, JWT auth context, polling-based async UX |
+| **Container** | Docker Compose | One-command local stack. Same images work in Kubernetes |
+| **Production** | Kubernetes (GKE-ready) | Manifests for StatefulSets, Deployments, Ingress with TLS |
+
+---
+
+## 5. End-to-End Flow (Legal Name Change)
+
+```
+Staff (USER role)
+│
+├─ POST /api/auth/login → JWT token
+│
+└─ POST /api/intake (multipart: customer_id, old_name, new_name, document, change_type)
+   │  → 202 Accepted + task_id (async, non-blocking)
+   │
+   ├─ Agent 1: Validation
+   │   ├─ Query rps_records WHERE customer_id = 'C001' → name = "Priya Sharma"
+   │   ├─ Compare old_name == rps.name → PASS
+   │   └─ Write VALIDATION_PASSED to audit_log
+   │
+   ├─ Agent 2: Document Processor
+   │   ├─ Code-level forgery: magic bytes, EXIF, PDF metadata → PASS/WARN/FAIL
+   │   ├─ Gemini Call 1 (extraction): is_valid_document? bride_name? married_name?
+   │   │   └─ If is_valid_document=false → FAIL immediately (selfie/screenshot guard)
+   │   ├─ Gemini Call 2 (forgery): tamper signals, per-signal JSON breakdown
+   │   ├─ Combine code + Gemini verdicts → final forgery_check
+   │   └─ Archive to mock FileNet → filenet_ref_id
+   │
+   └─ Agent 3: Confidence Scorer
+       ├─ Priority 0: if is_valid_document=false → 0% confidence, REJECT
+       ├─ Priority 1: if forgery FAIL → REJECT
+       ├─ Priority 2: if forgery WARN → FLAG (force human review)
+       ├─ Priority 3: if missing required fields → REJECT
+       ├─ Priority 4: if document type mismatch → REJECT
+       └─ Priority 5: threshold-based (≥85% → APPROVE, ≥65% → FLAG, else REJECT)
+           └─ Stage pending_request: overall_status = AI_VERIFIED_PENDING_HUMAN
+
+Checker (ADMIN role)
+│
+├─ GET /api/checker/queue (Redis-cached 30s)
+│   └─ Returns pending requests with AI summaries and scores
+│
+├─ Reviews: confidence score, forgery signals, document type, field match breakdown
+│
+└─ POST /api/checker/decide { request_id, decision: "APPROVED", checker_id, notes }
+    ├─ Validates checker_id exists and has ADMIN role
+    ├─ Updates pending_requests: checker_decision, checker_id, decided_at
+    ├─ Writes CHECKER_APPROVED/REJECTED to audit_log
+    ├─ Invalidates Redis cache
+    └─ If APPROVED → POST /api/rps/write → UPDATE rps_records SET name = new_name
+```
+
+---
+
+## 6. Security Design
+
+| Concern | Mitigation |
+|---------|-----------|
+| Secret leakage | `.env` excluded from git, `.env.example` has no real values |
+| Auth bypass | JWT validated on every protected route, inactive users blocked |
+| Privilege escalation | Role checked server-side on every admin endpoint — client role claim ignored |
+| HITL bypass | 3-layer enforcement (graph + API + DB constraint) |
+| Rate abuse | slowapi: 10 req/min per IP on intake |
+| Password storage | bcrypt (12 rounds) — never logged or returned over the wire |
+| CORS | Explicit `ALLOWED_ORIGINS` list — not wildcard |
+| AI hallucination on non-documents | `is_valid_document` field in extraction prompt blocks selfies before scoring |
+
+---
+
+## 7. Assumptions, Constraints & Known Limitations
 
 ### Assumptions
-
-| # | Assumption | Impact if Wrong |
-|---|-----------|-----------------|
-| 1 | Old value in intake form matches RPS case-insensitively with fuzzy tolerance | Legitimate requests may fail validation |
-| 2 | Gemini 1.5 Flash reliably extracts key fields from standard government documents | Lower confidence → more human review, not silent errors |
-| 3 | Checker operates in trusted internal network; no JWT required for prototype | Production requires SSO/JWT on all /api/checker/* endpoints |
-| 4 | One pending request per customer per change_type at a time | May block re-submissions; acceptable for banking compliance |
-| 5 | Document file size ≤ 20MB covers all supported document types | Large scans may be rejected |
+1. A single Gemini API key is sufficient for demo throughput (~20 requests/demo)
+2. The RPS system is represented faithfully by the `rps_records` PostgreSQL table
+3. FileNet document archival is represented by the `uploads/` directory with UUIDs
+4. Legal name changes are the primary high-volume change type warranting automation
 
 ### Constraints
+1. **Prototype scope:** Only Legal Name Change is implemented end-to-end
+2. **Gemini latency:** Document processing takes 5–15 seconds — acceptable for async UX, not for real-time
+3. **No distributed queue:** Background tasks use Python's asyncio thread pool. For production scale, replace with Celery + Redis
 
-1. **Mock dependencies:** FileNet and RPS are mocked. Real integration requires vendor API access.
-2. **Single change type demoed:** LEGAL_NAME_CHANGE is fully implemented. Others are scaffolded.
-3. **No authentication:** checker_id is self-reported. Production requires bank identity provider integration.
-4. **In-memory task queue:** For distributed deployment, replace with Celery + Redis queue.
-5. **Heuristic forgery detection:** Gemini's self-assessment is a first pass, not forensic analysis.
+### Known Limitations & Production Extensions
 
-### Known Limitations & Production Mitigations
+| Limitation | Production Fix |
+|-----------|---------------|
+| In-memory task queue | Celery + Redis Streams for distributed async processing |
+| Mock FileNet | IBM FileNet P8 REST API integration |
+| Mock RPS | Authenticated gRPC/REST call to core banking microservice |
+| Heuristic forgery detection | Computer vision tamper detection model (pixel-level analysis) |
+| Single Gemini model | Model routing: fast model for extraction, powerful model for forgery |
+| No SSO | OAuth 2.0 / SAML integration with bank's identity provider |
+| No field encryption | Encrypt PII at rest (customer_id, names) using column-level encryption |
 
-| Limitation | Production Mitigation |
-|-----------|----------------------|
-| Gemini forgery detection is heuristic | Add computer vision tamper detection; government API cross-checks |
-| Confidence thresholds manually set | A/B test against historical data; ML-based threshold optimization |
-| No real-time Checker notifications | WebSocket push or email alerts on new queue items |
-| In-memory task state lost on restart | Redis-backed Celery task queue |
-| No document retention policy | TTL-based file cleanup per data retention regulations |
+---
 
-### Trade-offs Made
+## 8. Observable System — Audit Trail
 
-- **Gemini Flash vs Pro:** Flash is faster and cheaper; Pro is more accurate on degraded documents. Production could route low-confidence extractions to Pro automatically.
-- **Sync LangGraph in thread pool vs full async:** The current approach (sync in ThreadPoolExecutor) is simpler, observable, and correct at prototype scale. Full async LangGraph nodes would be more efficient at production volume.
-- **Redis optional vs required:** Redis is a performance layer, not a critical dependency. Graceful degradation to direct DB queries is the right trade-off for resilience.
+Every agent step and human decision writes a structured JSON log entry to both:
+1. `logs/iasw.log` (structlog JSON)
+2. `audit_log` table (PostgreSQL, immutable, append-only)
+
+```sql
+-- Example: full audit trail for one request
+SELECT actor, action, detail, created_at
+FROM audit_log
+WHERE request_id = 'abc-123'
+ORDER BY created_at;
+
+-- actor               action                          created_at
+-- validation_agent    VALIDATION_PASSED               2026-04-29 02:15:01
+-- document_processor  GEMINI_EXTRACTION_SUCCESS       2026-04-29 02:15:06
+-- document_processor  FORGERY_VERDICT                 2026-04-29 02:15:08
+-- confidence_scorer   CONFIDENCE_SCORING_COMPLETE     2026-04-29 02:15:08
+-- checker             CHECKER_DECISION_APPROVED       2026-04-29 02:15:45
+-- rps                 RPS_WRITE_SUCCESS               2026-04-29 02:15:45
+```
+
+This satisfies banking regulatory requirements for full traceability of AI-assisted decisions.
