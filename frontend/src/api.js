@@ -7,7 +7,9 @@
  */
 import axios from 'axios';
 
-export const API_BASE = 'http://localhost:8000';
+// Allow the API base to be injected at build time via Vite env. Falls back to
+// localhost:8000 for the old standalone dev workflow.
+export const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 export const TOKEN_KEY = 'iasw_token';
 export const USER_KEY = 'iasw_user';
 

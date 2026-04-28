@@ -279,8 +279,10 @@ def compute_confidence(
     # Priority (highest to lowest):
     #   1. FAIL forgery → always REJECT, regardless of field scores
     #   2. WARN forgery → always FLAG, never auto-approve
-    #   3. Missing required fields for this change_type → REJECT
-    #   4. Document type mismatch (declared vs Gemini-detected) → REJECT
+    #   3. Document type mismatch (declared vs Gemini-detected) → REJECT
+    #      (runs BEFORE missing-fields so the end user gets the clearest reason
+    #       e.g. "you uploaded a selfie" instead of "bride_name not extracted")
+    #   4. Missing required fields for this change_type → REJECT
     #   5. Threshold-based: overall ≥ approve_threshold → APPROVE
     #                        overall ≥ flag_threshold   → FLAG
     #                        otherwise                  → REJECT
@@ -311,32 +313,48 @@ def compute_confidence(
         recommendation = "FLAG"
 
     else:
-        # ── Step 3: Missing required fields ───────────────────────────────────
-        if missing_fields:
-            recommendation = "REJECT"
-            reject_reason = (
-                f"Required fields could not be extracted: {', '.join(missing_fields)}. "
-                f"Please re-upload a clearer, legible document."
-            )
-
-        # ── Step 4: Document type mismatch ────────────────────────────────────
+        # ── Step 3: Document type mismatch (takes priority over missing fields,
+        # because "you uploaded a selfie" is more informative than "bride_name
+        # could not be extracted" for the end user) ─────────────────────────
         if recommendation is None and change_type == "LEGAL_NAME_CHANGE":
-            detected_type = extracted_fields.get("document_type_detected", "")
+            detected_type = (extracted_fields.get("document_type_detected") or "").strip()
             expected_type_map = {
                 "MARRIAGE_CERTIFICATE": "Marriage Certificate",
                 "GAZETTE_NOTIFICATION": "Gazette Notification",
                 "DEED_POLL":            "Deed Poll",
             }
             expected_type = expected_type_map.get(document_type, document_type)
-            if not detected_type:
-                # Empty detection is a soft concern — Gemini couldn't identify
-                # the document type at all. Force human review rather than
-                # silently passing.
-                recommendation = "FLAG"
+
+            # Explicit "not a real document" bucket — Gemini is instructed to
+            # return this whenever the image isn't one of the four known types.
+            # Treat it as a hard reject rather than letting the threshold path
+            # rescue it via name fuzzy-matching.
+            NON_DOCUMENT_TOKENS = {"other", "screenshot", "selfie", "photo", "photograph",
+                                   "passport photo", "picture", "none", "unknown"}
+            is_non_document = (
+                not detected_type
+                or detected_type.lower() in NON_DOCUMENT_TOKENS
+                or "other" in detected_type.lower()
+                or "screenshot" in detected_type.lower()
+            )
+
+            if is_non_document:
+                recommendation = "REJECT"
+                reject_reason = (
+                    "The uploaded image does not appear to be an official supporting "
+                    f"document. AI detected: '{detected_type or 'unidentified'}'. "
+                    f"Please upload a genuine {expected_type}."
+                )
             else:
+                # Tight match: expected type's key tokens must appear in the
+                # detected type. This avoids accidental matches like
+                # "Passport" vs "Marriage Certificate".
+                expected_lower = expected_type.lower()
+                detected_lower = detected_type.lower()
+                key_token = expected_lower.split()[-1]  # "certificate" / "notification" / "poll"
                 is_expected_type = (
-                    expected_type.lower() in detected_type.lower()
-                    or detected_type.lower() in expected_type.lower()
+                    expected_lower in detected_lower
+                    or (key_token in detected_lower and expected_lower.split()[0] in detected_lower)
                 )
                 if not is_expected_type:
                     recommendation = "REJECT"
@@ -345,6 +363,14 @@ def compute_confidence(
                         f"but the AI detected '{detected_type}'. "
                         f"Please re-upload the correct document."
                     )
+
+        # ── Step 4: Missing required fields ──────────────────────────────────
+        if recommendation is None and missing_fields:
+            recommendation = "REJECT"
+            reject_reason = (
+                f"Required fields could not be extracted: {', '.join(missing_fields)}. "
+                f"Please re-upload a clearer, legible document."
+            )
 
         # ── Step 5: Threshold-based recommendation ────────────────────────────
         if recommendation is None:

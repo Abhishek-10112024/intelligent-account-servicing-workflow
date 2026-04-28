@@ -68,7 +68,18 @@ You are a document verification AI for a bank. Analyse the provided document ima
   "extraction_confidence": "<HIGH, MEDIUM, or LOW>"
 }
 
-Return ONLY the JSON object. No explanation. If a field cannot be determined, use null.
+CRITICAL RULES:
+- If the image is NOT one of the four declared document types above (for
+  example: a selfie, passport photo, photograph of a person, screenshot, blank
+  page, scenery, or any other content), you MUST set
+  "document_type_detected" to "Other/Screenshot" and set both "bride_name"
+  and "married_name" to null. Do NOT invent names or guess. Do NOT re-use
+  names you see anywhere outside the document (e.g. from surrounding text).
+- "bride_name" and "married_name" may ONLY be populated when the document is
+  a genuine Marriage Certificate, Gazette Notification, or Deed Poll that
+  explicitly prints those names. Otherwise return null for both.
+- Return ONLY the JSON object. No explanation. If a field cannot be
+  determined, use null.
 """,
 }
 
@@ -102,11 +113,19 @@ Inspect for these signals and return a JSON object with this exact shape:
 }
 
 Scoring policy for overall_verdict (MUST follow):
-- FAIL: clear evidence of tampering, a UI screenshot, AI-generated content, or a
-  specimen/sample watermark on what is meant to be a real submission.
-- WARN: one or more soft signals (inconsistent fonts, local recompression,
-  unclear seal geometry) but not conclusive.
-- PASS: no notable tamper signals across any of the above checks.
+- FAIL: clear evidence of tampering, a UI screenshot, AI-generated content, a
+  specimen/sample watermark on what is meant to be a real submission, OR the
+  image is plainly NOT an official document (for example: a selfie / passport
+  photo / picture of a person, a random photograph, blank page, scenery,
+  receipt, ID card, or any other non-document content). When in doubt about
+  whether the image is the claimed document type, choose FAIL — not WARN —
+  and explain in "reasoning" that the image does not appear to be an official
+  supporting document.
+- WARN: the image is plausibly an official document but shows one or more
+  soft tamper signals (inconsistent fonts, local recompression, unclear seal
+  geometry) without being conclusive.
+- PASS: the image is clearly an official document of the expected kind and
+  shows no notable tamper signals across any of the above checks.
 
 Return ONLY the JSON object. No extra text.
 """
@@ -406,11 +425,31 @@ def process_document(
             logger.error("GEMINI_EXTRACTION_FAILED", error=str(exc))
             if settings.GEMINI_STRICT:
                 raise
-            # Graceful degradation: fall back to mock so processing continues
-            used_mode = "mock"
-            logger.warning("LLM_FALLBACK_TO_MOCK", reason=str(exc))
-            extracted_fields = MOCK_EXTRACTIONS.get(change_type, {})
-            extracted_fields["extraction_confidence"] = "LOW"
+            # ── Graceful-but-safe degradation ─────────────────────────────────
+            # Previously we fell back to the mock extraction values so the
+            # pipeline could keep running. That was actively dangerous: the
+            # mock values happen to equal the default form values, producing a
+            # fake 100% name match on ANY image when Gemini is down.
+            #
+            # Now we return EMPTY extraction fields (so the scorer sees missing
+            # data → REJECT/FLAG instead of a perfect match) and tag a loud
+            # signal that the Checker / logs can see.
+            used_mode = "gemini_unavailable"
+            logger.warning("LLM_FALLBACK_SAFE", reason=str(exc))
+            extracted_fields = {
+                # Empty identifying fields — scorer will treat as missing.
+                "document_type_detected": "",
+                "bride_name":   None,
+                "married_name": None,
+                "issue_date":   None,
+                "issuing_authority": None,
+                "document_number":   None,
+                "is_legible":          False,
+                # Self-report low confidence so authenticity score drops too.
+                "extraction_confidence": "LOW",
+                "_llm_unavailable":       True,
+                "_llm_error":             str(exc),
+            }
 
     # ── Step 3: Dedicated Gemini forgery analysis ────────────────────────────
     # A second, focused call purely for tamper/forgery assessment. This gives
@@ -420,7 +459,8 @@ def process_document(
     gemini_forgery_verdict: str
     gemini_signals: list[dict]
 
-    if used_mode == "mock":
+    if settings.USE_MOCK_LLM:
+        # True mock mode (no key configured) — short-circuit with mock payload.
         forgery_payload = dict(MOCK_FORGERY_ANALYSIS)
         gemini_forgery_verdict = forgery_payload["overall_verdict"]
         gemini_signals = []  # mock is clean by design
@@ -435,6 +475,8 @@ def process_document(
                 raise
             # Loss of a signal is itself a signal — demote to WARN so the
             # Checker knows they are working with incomplete information.
+            # Combined with the empty extraction above, this guarantees no
+            # request is auto-APPROVED when Gemini is down.
             forgery_payload = {
                 "overall_verdict": "WARN",
                 "overall_forgery_risk": None,
