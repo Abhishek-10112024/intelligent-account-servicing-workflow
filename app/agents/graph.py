@@ -111,6 +111,7 @@ def validate_request_node(state: WorkflowState) -> dict:
         customer_id=state["customer_id"],
         change_type=state["change_type"],
         old_value=state["old_value"],
+        db=db,
     )
 
     log_agent_step(

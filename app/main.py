@@ -20,7 +20,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from app.config import settings
-from app.database import init_db
+from app.database import init_db, seed_rps_records
 from app.routers import intake, checker, rps, auth
 from app.routers.llm import router as llm_router
 from app.services.observability import get_logger
@@ -72,18 +72,24 @@ async def on_startup():
     # Seed admin + demo user on first boot (idempotent).
     seed_result = seed_default_users()
 
+    # Seed RPS demo customers on first boot (idempotent).
+    rps_result = seed_rps_records()
+
     # Connect to Redis (non-blocking; gracefully degrades if unavailable)
     await cache_manager.connect()
-    
+
     logger.info(
         "IASW_STARTED",
         version=settings.APP_VERSION,
         env=settings.APP_ENV,
         llm_mode="mock" if settings.USE_MOCK_LLM else "gemini",
+        llm_model=settings.GEMINI_MODEL,
         db=settings.DATABASE_URL,
         cache="redis" if cache_manager.available else "disabled",
         users_seeded=seed_result["created"],
         users_existing=seed_result["existing"],
+        rps_seeded=rps_result["created"],
+        rps_existing=rps_result["existing"],
     )
     print(f"\n{'='*60}")
     print(f"  IASW Server Started  (v{settings.APP_VERSION})")

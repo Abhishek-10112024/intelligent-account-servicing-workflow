@@ -161,10 +161,67 @@ class UserRegistration(Base):
     created_at    = Column(DateTime, default=datetime.utcnow)
 
 
+# ── Table 5: RPS Records (Mock Core Banking System) ──────────────────────────
+class RpsRecord(Base):
+    """
+    Mock representation of the bank's Record Processing System (RPS).
+
+    In production this would be fetched via an authenticated REST call to the
+    core banking microservice. Here we store it in PostgreSQL so it is visible,
+    queryable, and inspectable by the interviewer / demo audience.
+
+    Lifecycle: read-only by agents; written only after Checker APPROVAL via
+    the /api/rps/write endpoint (the HITL boundary).
+    """
+    __tablename__ = "rps_records"
+
+    customer_id  = Column(String, primary_key=True)   # e.g. C001
+    name         = Column(String, nullable=False)      # Current legal name in RPS
+    dob          = Column(String)                      # Date of birth YYYY-MM-DD
+    address      = Column(String)                      # Registered address
+    phone        = Column(String)                      # Contact phone
+    email        = Column(String)                      # Contact email
+    updated_at   = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ── DB Initialisation ─────────────────────────────────────────────────────────
 def init_db():
-    """Create all tables. Called once at application startup."""
+    """Create all tables (including rps_records). Called once at startup."""
     Base.metadata.create_all(bind=engine)
+
+
+def seed_rps_records() -> dict:
+    """
+    Populate rps_records with the 3 demo customers if they don't exist.
+    Idempotent — safe to call on every startup.
+    Called from main.py alongside seed_default_users().
+    """
+    from app.config import settings  # local import to avoid circular dependency
+    result: dict = {"created": [], "existing": []}
+    db = SessionLocal()
+    try:
+        for cid, data in settings.MOCK_RPS_RECORDS.items():
+            existing = db.query(RpsRecord).filter(RpsRecord.customer_id == cid).first()
+            if existing:
+                result["existing"].append(cid)
+                continue
+            db.add(RpsRecord(
+                customer_id=cid,
+                name=data.get("name", ""),
+                dob=data.get("dob"),
+                address=data.get("address"),
+                phone=data.get("phone"),
+                email=data.get("email"),
+            ))
+            result["created"].append(cid)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        import logging
+        logging.getLogger(__name__).error("SEED_RPS_FAILED: %s", exc)
+    finally:
+        db.close()
+    return result
 
 
 # ── FastAPI dependency ────────────────────────────────────────────────────────
