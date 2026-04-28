@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db, PendingRequest
 from app.models import CheckerDecision, CheckerDecisionResponse, PendingRequestRead, AuditLogRead
-from app.database import AuditLog
+from app.database import AuditLog, User
 from app.services.observability import log_agent_step, get_logger
 from app.routers.rps import execute_rps_write
 from fastapi.responses import FileResponse
@@ -34,15 +34,61 @@ from app.services.cache import (
     set_cached_checker_queue,
     invalidate_checker_cache,
 )
+from app.services.auth import require_admin
 
 router = APIRouter(prefix="/api/checker", tags=["Checker"])
 logger = get_logger("checker_router")
+
+
+# ── AI-vs-Checker agreement helpers ───────────────────────────────────────────
+
+def _ai_checker_agreement(ai_recommendation: str | None, checker_decision: str) -> dict:
+    """
+    Compute whether the Checker's decision matched the AI's recommendation.
+
+    AI outputs APPROVE / FLAG / REJECT; Checker outputs APPROVED / REJECTED.
+    We treat FLAG as "human adjudication required" — by definition not an
+    agreement or disagreement, it's the AI deferring to the Checker.
+
+    Returns:
+        {
+            "ai_recommendation": str | None,
+            "checker_decision":  str,
+            "agreement":         "agree" | "disagree" | "deferred" | "unknown",
+        }
+    """
+    ai = (ai_recommendation or "").upper().strip()
+    ck = checker_decision.upper().strip()
+
+    if not ai:
+        return {
+            "ai_recommendation": ai_recommendation,
+            "checker_decision":  checker_decision,
+            "agreement":         "unknown",
+        }
+    if ai == "FLAG":
+        # AI explicitly asked a human to decide — not a disagreement signal.
+        return {
+            "ai_recommendation": ai_recommendation,
+            "checker_decision":  checker_decision,
+            "agreement":         "deferred",
+        }
+    if (ai == "APPROVE" and ck == "APPROVED") or (ai == "REJECT" and ck == "REJECTED"):
+        agreement = "agree"
+    else:
+        agreement = "disagree"
+    return {
+        "ai_recommendation": ai_recommendation,
+        "checker_decision":  checker_decision,
+        "agreement":         agreement,
+    }
 
 
 @router.get("/queue", response_model=list[PendingRequestRead], summary="Get all pending requests")
 async def get_checker_queue(
     status: str = "AI_VERIFIED_PENDING_HUMAN",
     db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
 ):
     """
     Return all requests with the given status (default: awaiting human review).
@@ -84,7 +130,11 @@ async def get_checker_queue(
 
 
 @router.get("/queue/{request_id}", response_model=PendingRequestRead, summary="Get a single request")
-def get_request_detail(request_id: str, db: Session = Depends(get_db)):
+def get_request_detail(
+    request_id: str,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
     """Return full details for a single pending request (for Checker review modal)."""
     record = db.query(PendingRequest).filter(PendingRequest.id == request_id).first()
     if not record:
@@ -93,7 +143,11 @@ def get_request_detail(request_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/document/{request_id}", summary="Get uploaded document image")
-def get_document(request_id: str, db: Session = Depends(get_db)):
+def get_document(
+    request_id: str,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
     """Return the uploaded document for the human checker to view."""
     record = db.query(PendingRequest).filter(PendingRequest.id == request_id).first()
     if not record:
@@ -111,7 +165,10 @@ def get_document(request_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/history", response_model=list[PendingRequestRead], summary="Get decided requests")
-def get_checker_history(db: Session = Depends(get_db)):
+def get_checker_history(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
     """Return all requests that have been decided (APPROVED or REJECTED)."""
     records = (
         db.query(PendingRequest)
@@ -124,7 +181,11 @@ def get_checker_history(db: Session = Depends(get_db)):
 
 
 @router.get("/audit/{request_id}", response_model=list[AuditLogRead], summary="Audit trail for a request")
-def get_audit_trail(request_id: str, db: Session = Depends(get_db)):
+def get_audit_trail(
+    request_id: str,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
     """Return the full audit trail for a request (all agent steps + human decisions)."""
     logs = (
         db.query(AuditLog)
@@ -135,19 +196,87 @@ def get_audit_trail(request_id: str, db: Session = Depends(get_db)):
     return logs
 
 
+@router.get("/agreement-stats", summary="AI recommendation vs Checker decision stats")
+def get_agreement_stats(
+    limit: int = 500,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """
+    Aggregate how often the Checker agreed with the AI's recommendation.
+
+    Reads the audit log for CHECKER_APPROVED / CHECKER_REJECTED entries (newest
+    first, capped at `limit`) and returns counts grouped by the AI recommendation
+    that was in effect when the Checker decided.
+
+    Interpretation:
+        agree     — Checker confirmed the AI's APPROVE/REJECT call
+        disagree  — Checker overrode the AI (e.g. AI said APPROVE, Checker rejected)
+        deferred  — AI said FLAG; Checker's decision is the authoritative call
+                    (not counted as agreement or disagreement)
+
+    Use this to calibrate thresholds:
+        - High 'disagree' on APPROVE recommendations → raise APPROVE_THRESHOLD
+        - High 'disagree' on REJECT recommendations → lower FLAG_THRESHOLD
+    """
+    import json
+
+    rows = (
+        db.query(AuditLog)
+        .filter(AuditLog.action.in_(["CHECKER_APPROVED", "CHECKER_REJECTED"]))
+        .order_by(AuditLog.created_at.desc())
+        .limit(max(1, min(limit, 5000)))
+        .all()
+    )
+
+    # Shape:
+    #   { "APPROVE": {"agree": n, "disagree": n}, "REJECT": {...}, "FLAG": {"deferred": n},
+    #     "unknown": {"unknown": n} }
+    stats: dict[str, dict[str, int]] = {}
+    total = 0
+    for row in rows:
+        try:
+            detail = json.loads(row.detail) if row.detail else {}
+        except json.JSONDecodeError:
+            detail = {}
+        ai = (detail.get("ai_recommendation") or "unknown").upper()
+        verdict = (detail.get("ai_vs_checker") or "unknown").lower()
+        stats.setdefault(ai, {}).setdefault(verdict, 0)
+        stats[ai][verdict] += 1
+        total += 1
+
+    # Compute simple derived metrics that matter to threshold calibration.
+    def _rate(bucket: str, key: str) -> float | None:
+        counts = stats.get(bucket, {})
+        seen = sum(counts.values())
+        return round(counts.get(key, 0) / seen, 4) if seen else None
+
+    return {
+        "sample_size":    total,
+        "window_limit":   limit,
+        "by_ai_recommendation": stats,
+        "summary": {
+            "approve_agreement_rate":  _rate("APPROVE", "agree"),
+            "reject_agreement_rate":   _rate("REJECT",  "agree"),
+            "approve_override_rate":   _rate("APPROVE", "disagree"),
+            "reject_override_rate":    _rate("REJECT",  "disagree"),
+        },
+    }
+
+
 @router.post("/decide", response_model=CheckerDecisionResponse, summary="Checker approves or rejects")
 async def checker_decide(
     decision: CheckerDecision,
     db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
 ):
     """
     ══════════════════════════════════════════════════════════
     HITL BOUNDARY — This is the ONLY path to RPS write.
     ══════════════════════════════════════════════════════════
 
-    The Checker must:
-      1. Provide their checker_id (non-empty)
-      2. Submit decision = APPROVED or REJECTED
+    Requires ADMIN role. The admin's identity is taken from the JWT —
+    any `checker_id` in the request body is ignored.
 
     On APPROVED:
       - Record is updated in pending_requests
@@ -161,16 +290,14 @@ async def checker_decide(
 
     Cache: invalidates checker queue cache after any decision.
     """
+    # Identity comes from the JWT.
+    checker_id = admin.username
+
     # ── Input validation ──────────────────────────────────────────────────────
     if decision.decision not in ("APPROVED", "REJECTED"):
         raise HTTPException(
             status_code=422,
             detail="decision must be 'APPROVED' or 'REJECTED'.",
-        )
-    if not decision.checker_id.strip():
-        raise HTTPException(
-            status_code=422,
-            detail="checker_id is required. AI cannot act as a Checker.",
         )
 
     # ── Fetch request ─────────────────────────────────────────────────────────
@@ -192,7 +319,7 @@ async def checker_decide(
     rps_updated = False
 
     # ── Update record ─────────────────────────────────────────────────────────
-    record.checker_id       = decision.checker_id
+    record.checker_id       = checker_id
     record.checker_decision = decision.decision
     record.checker_notes    = decision.notes
     record.overall_status   = decision.decision   # APPROVED or REJECTED
@@ -206,7 +333,7 @@ async def checker_decide(
             customer_id=record.customer_id,
             change_type=record.change_type,
             new_value=record.new_value,
-            checker_id=decision.checker_id,
+            checker_id=checker_id,
             db=db,
         )
         rps_updated = rps_result["success"]
@@ -224,17 +351,29 @@ async def checker_decide(
     logger.debug("CHECKER_CACHE_INVALIDATED", request_id=record.id)
 
     # ── Audit log ─────────────────────────────────────────────────────────────
+    # Record the AI-vs-Checker agreement so we can measure AI precision/recall
+    # over time and calibrate thresholds against real outcomes.
+    agreement = _ai_checker_agreement(record.ai_recommendation, decision.decision)
+    overall_confidence = None
+    if record.confidence_name is not None and record.confidence_authenticity is not None:
+        overall_confidence = round(
+            record.confidence_name * 0.6 + record.confidence_authenticity * 0.4,
+            4,
+        )
     log_agent_step(
         db=db,
         request_id=record.id,
-        actor=f"checker:{decision.checker_id}",
+        actor=f"checker:{checker_id}",
         action=f"CHECKER_{decision.decision}",
         detail={
-            "decision":    decision.decision,
-            "checker_id":  decision.checker_id,
-            "notes":       decision.notes,
-            "rps_updated": rps_updated,
-            "decided_at":  now.isoformat(),
+            "decision":           decision.decision,
+            "checker_id":         checker_id,
+            "notes":              decision.notes,
+            "rps_updated":        rps_updated,
+            "decided_at":         now.isoformat(),
+            "ai_recommendation":  record.ai_recommendation,
+            "ai_vs_checker":      agreement["agreement"],
+            "overall_confidence": overall_confidence,
         },
     )
 
@@ -243,7 +382,7 @@ async def checker_decide(
         status=decision.decision,
         rps_updated=rps_updated,
         message=(
-            f"Request {record.id} has been {decision.decision} by {decision.checker_id}. "
+            f"Request {record.id} has been {decision.decision} by {checker_id}. "
             + ("RPS record updated successfully." if rps_updated else "RPS not updated.")
         ),
     )

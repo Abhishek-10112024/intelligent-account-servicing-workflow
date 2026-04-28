@@ -21,11 +21,12 @@ from slowapi.middleware import SlowAPIMiddleware
 
 from app.config import settings
 from app.database import init_db
-from app.routers import intake, checker, rps
+from app.routers import intake, checker, rps, auth
 from app.routers.llm import router as llm_router
 from app.services.observability import get_logger
 from app.services.cache import cache_manager
 from app.services.async_tasks import task_manager
+from app.services.auth import seed_default_users
 from app.services.rate_limiter import limiter  # avoids circular import with intake.py
 
 logger = get_logger("main")
@@ -65,9 +66,12 @@ app.add_middleware(SlowAPIMiddleware)
 # ── Startup & Shutdown lifecycle ──────────────────────────────────────────────
 @app.on_event("startup")
 async def on_startup():
-    """Initialize database and connect to Redis cache."""
+    """Initialize database, seed users, and connect to Redis cache."""
     init_db()
-    
+
+    # Seed admin + demo user on first boot (idempotent).
+    seed_result = seed_default_users()
+
     # Connect to Redis (non-blocking; gracefully degrades if unavailable)
     await cache_manager.connect()
     
@@ -78,6 +82,8 @@ async def on_startup():
         llm_mode="mock" if settings.USE_MOCK_LLM else "gemini",
         db=settings.DATABASE_URL,
         cache="redis" if cache_manager.available else "disabled",
+        users_seeded=seed_result["created"],
+        users_existing=seed_result["existing"],
     )
     print(f"\n{'='*60}")
     print(f"  IASW Server Started  (v{settings.APP_VERSION})")
@@ -88,6 +94,14 @@ async def on_startup():
     print(f"  Frontend : http://localhost:8000")
     print(f"  API Docs : http://localhost:8000/docs")
     print(f"  Checker  : http://localhost:8000/checker.html")
+    print(f"{'='*60}")
+    # ── Demo credentials banner ───────────────────────────────────────────────
+    # These are printed every boot so they're easy to find during a demo.
+    # Override with SEED_*_USERNAME / SEED_*_PASSWORD env vars in production,
+    # or disable seeding entirely by rotating these credentials after first boot.
+    print("  DEMO CREDENTIALS (change in production!):")
+    print(f"    Admin : {settings.SEED_ADMIN_USERNAME} / {settings.SEED_ADMIN_PASSWORD}")
+    print(f"    User  : {settings.SEED_USER_USERNAME} / {settings.SEED_USER_PASSWORD}")
     print(f"{'='*60}\n")
 
 
@@ -98,6 +112,7 @@ async def on_shutdown():
     logger.info("IASW_SHUTDOWN")
 
 # ── Routers ───────────────────────────────────────────────────────────────────
+app.include_router(auth.router)
 app.include_router(intake.router)
 app.include_router(checker.router)
 app.include_router(rps.router)

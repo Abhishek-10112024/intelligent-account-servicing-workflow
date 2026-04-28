@@ -1,6 +1,68 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios';
 import { ShieldCheck, User, Search, RefreshCw, CheckCircle2, XCircle } from 'lucide-react';
+import api from '../api';
+
+// ── Document preview ──────────────────────────────────────────────────────────
+// The document endpoint is JWT-protected, and <iframe src="..."> can't send
+// Authorization headers. So we fetch it as a blob via the auth'd axios client
+// and feed a blob URL to the iframe.
+function DocumentPreview({ requestId }) {
+  const [url, setUrl] = useState(null);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    let revoke = null;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await api.get(`/api/checker/document/${requestId}`, { responseType: 'blob' });
+        if (cancelled) return;
+        const objectUrl = URL.createObjectURL(data);
+        revoke = objectUrl;
+        setUrl(objectUrl);
+      } catch (e) {
+        if (!cancelled) setErr('Failed to load document preview.');
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (revoke) URL.revokeObjectURL(revoke);
+    };
+  }, [requestId]);
+
+  if (err) {
+    return (
+      <div style={{
+        width: '100%', height: 250, border: '1px solid var(--border-color)',
+        borderRadius: '0.5rem', display: 'flex', alignItems: 'center',
+        justifyContent: 'center', color: 'var(--danger-color)', fontSize: '0.85rem',
+      }}>
+        {err}
+      </div>
+    );
+  }
+  if (!url) {
+    return (
+      <div style={{
+        width: '100%', height: 250, border: '1px solid var(--border-color)',
+        borderRadius: '0.5rem', display: 'flex', alignItems: 'center',
+        justifyContent: 'center', color: 'var(--text-secondary)', fontSize: '0.85rem',
+      }}>
+        Loading preview…
+      </div>
+    );
+  }
+  return (
+    <iframe
+      src={url}
+      style={{
+        width: '100%', height: 250, border: '1px solid var(--border-color)',
+        borderRadius: '0.5rem', backgroundColor: '#fff',
+      }}
+      title="Document Preview"
+    />
+  );
+}
 
 export default function Checker() {
   const [queue, setQueue] = useState([]);
@@ -8,15 +70,15 @@ export default function Checker() {
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
   const [error, setError] = useState(null);
-  
-  // Simulated Checker ID for the demo
-  const checkerId = "checker_sup_01";
+
+  // Note: checker identity is now taken from the JWT on the backend.
+  // Nothing to pass from the client.
 
   const fetchQueue = async () => {
     setLoading(true);
     try {
-      const response = await axios.get('http://localhost:8000/api/checker/queue');
-      const historyResponse = await axios.get('http://localhost:8000/api/checker/history');
+      const response = await api.get('/api/checker/queue');
+      const historyResponse = await api.get('/api/checker/history');
       setQueue(response.data);
       setHistoryQueue(historyResponse.data);
       setError(null);
@@ -34,9 +96,8 @@ export default function Checker() {
   const handleDecision = async (requestId, decision) => {
     setActionLoading(true);
     try {
-      await axios.post('http://localhost:8000/api/checker/decide', {
+      await api.post('/api/checker/decide', {
         request_id: requestId,
-        checker_id: checkerId,
         decision: decision,
         notes: decision === 'APPROVED' ? "All documents verified by checker." : "Rejected by checker."
       });
@@ -128,14 +189,10 @@ export default function Checker() {
                 </div>
               </div>
 
-              {/* Document Preview */}
+              {/* Document Preview — fetched via auth'd client, rendered as blob URL */}
               <div style={{ marginTop: '1rem' }}>
                  <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>Uploaded Document ({item.document_type || 'Unknown'})</div>
-                 <iframe 
-                   src={`http://localhost:8000/api/checker/document/${item.id}`} 
-                   style={{ width: '100%', height: '250px', border: '1px solid var(--border-color)', borderRadius: '0.5rem', backgroundColor: '#fff' }} 
-                   title="Document Preview" 
-                 />
+                 <DocumentPreview requestId={item.id} />
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '1rem' }}>

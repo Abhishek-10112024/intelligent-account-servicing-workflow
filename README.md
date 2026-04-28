@@ -24,7 +24,7 @@ flowchart TD
 
     subgraph LG["LangGraph Pipeline (Thread Pool)"]
         A1["Agent 1: Validation\nRPS lookup · old-value check"]
-        A2["Agent 2: Document Processor\nGemini 1.5 Flash Vision\nOCR + forgery heuristic"]
+        A2["Agent 2: Document Processor\nGemini Vision extraction\n+ dedicated forgery pass\n+ code-level metadata/magic-byte checks"]
         A3["Agent 3: Confidence Scorer\nFuzzy match · 5-priority chain\nAI summary generation"]
         ST["Stage to DB\nAI_VERIFIED_PENDING_HUMAN"]
     end
@@ -191,7 +191,7 @@ curl http://localhost:8000/api/checker/audit/{request_id}
 │   ├── agents/
 │   │   ├── graph.py               # LangGraph 4-node state machine
 │   │   ├── validation_agent.py    # Agent 1: RPS customer + value cross-check
-│   │   ├── document_processor.py  # Agent 2: Gemini multimodal OCR + forgery
+│   │   ├── document_processor.py  # Agent 2: Gemini extraction + dedicated forgery analysis
 │   │   └── confidence_scorer.py   # Agent 3: Fuzzy match + 5-priority scoring
 │   │
 │   ├── routers/
@@ -202,6 +202,7 @@ curl http://localhost:8000/api/checker/audit/{request_id}
 │   └── services/
 │       ├── async_tasks.py         # Background task manager (thread pool executor)
 │       ├── cache.py               # Redis cache manager (get/set/invalidate)
+│       ├── forgery_checks.py      # Deterministic forgery signals (magic bytes, PDF/EXIF metadata, hygiene)
 │       ├── rate_limiter.py        # SlowAPI limiter singleton
 │       ├── retry_utils.py         # Exponential backoff + circuit breaker (Gemini)
 │       ├── filenet_mock.py        # Document archival (local filesystem mock)
@@ -320,35 +321,117 @@ grep "GEMINI_EXTRACTION_SUCCESS" logs/iasw.log  # should have entries
 
 ---
 
+## 🛡 Forgery Detection Pipeline
+
+Forgery assessment runs in three layers, and the final `forgery_check` verdict is the most severe of all three:
+
+### Layer 1 — Deterministic code checks (`app/services/forgery_checks.py`)
+
+Pure Python, no LLM. Runs on every upload, produces structured per-signal output:
+
+| Check | Severity | What it catches |
+|---|---|---|
+| File hygiene (empty, oversized, double-extension) | `critical` | Broken or adversarial uploads, `.pdf.exe` smuggling |
+| Magic-byte validation | `critical` | Extension-vs-content mismatch (`.jpg` with non-JPEG bytes) |
+| Suspiciously small file | `warn` | Re-compressed low-quality fakes |
+| PDF metadata — modified before created | `critical` | Tampering (impossible timestamps) |
+| PDF metadata — future creation date | `critical` | Fabricated documents |
+| PDF metadata — edited by Acrobat Pro / Foxit / Illustrator / etc. | `warn` | Non-native editing of documents meant to be scans |
+| PDF metadata — edited days after creation | `warn` | Re-saved edits |
+| Image EXIF — future timestamp | `critical` | Impossible capture time |
+| Image EXIF — edited by Photoshop / GIMP / Lightroom / etc. | `warn` | Documents processed through image editors |
+| Image EXIF — phone-camera origin | `info` | Phone-captured "official" documents (advisory only) |
+
+### Layer 2 — Dedicated Gemini forgery analysis
+
+A second Gemini call whose only job is tamper assessment. It returns structured per-signal output (text alignment, font consistency, local recompression, seal geometry, paper texture vs flat render, compression uniformity, AI-generation indicators, specimen/sample watermark detection) plus an overall 0–10 risk score and verdict. Critical signals (specimen watermark, AI generation, high overall risk) map to `FAIL`; soft signals map to `WARN`.
+
+Keeping forgery analysis separate from field extraction materially improves both — one focused prompt per job.
+
+### Layer 3 — Combined verdict + Checker-facing reasoning
+
+Code and Gemini signals are merged; the final verdict is the most severe of the two layers. The full signal list is written to the audit trail. When the verdict is `WARN` or `FAIL`, the top signals and Gemini's reasoning are surfaced directly in the Checker Review UI — the human sees *why* a request was flagged, not just a label.
+
+### Degradation behaviour
+
+- Gemini key missing → mock-mode clean analysis (advisory only)
+- Gemini forgery call fails with a key set → demoted to `WARN` with a `gemini_forgery_analysis_unavailable` signal (we don't silently pretend all is well)
+- Code checks always run regardless of LLM availability
+
+### Intentional follow-up work (not in this pass)
+
+- Perceptual hashing across the request corpus (duplicate/template-reuse detection)
+- Error Level Analysis for JPEGs (localised tamper heatmap)
+- Dedicated AI-image-generation detectors
+- Issuing-authority API cross-checks for document numbers
+
+---
+
 ## 📊 Confidence Scoring Logic
 
 The confidence scorer uses a **5-priority decision chain**:
 
 ```
-1. forgery_check == FAIL     → REJECT  (highest priority)
+1. forgery_check == FAIL     → REJECT  (reason includes any missing-field info)
 2. forgery_check == WARN     → FLAG    (force human review)
-3. document_type mismatch    → REJECT
-4. missing required fields   → REJECT
-5. threshold-based scoring   → APPROVE (≥0.80) / FLAG (0.60–0.79) / REJECT (<0.60)
+3. missing required fields   → REJECT
+4. document_type mismatch    → REJECT  (empty detection → FLAG, never silent pass)
+5. threshold-based scoring   → APPROVE (≥ approve_th) / FLAG (≥ flag_th) / REJECT (<flag_th)
 ```
 
 **Score formula:**
 ```
 overall = (name_match × 0.6) + (authenticity × 0.4)
 
-name_match    = fuzzywuzzy token_sort_ratio(extracted_name, new_value) / 100
-authenticity  = Gemini self-reported extraction_confidence mapped to 0.0–1.0
-                + penalty for WARN forgery (−0.16)
-                + penalty for FAIL forgery (−0.55)
+name_match    = min(old_name_score, new_name_score)          ← WEAKEST-LINK, not average.
+                A correct old name + wrong new name cannot average its way
+                to a pass. Both sides must clear the bar.
+
+authenticity  = (extraction_confidence × 0.4) + (forgery_score × 0.6)
+                where extraction_confidence ∈ {HIGH→0.90, MEDIUM→0.70, LOW→0.45}
+                and   forgery_score         ∈ {PASS→1.00, WARN→0.70, FAIL→0.10}
 ```
 
-| Score | Recommendation |
-|-------|---------------|
-| ≥ 0.80 | **APPROVE** |
-| 0.60 – 0.79 | **FLAG** (Checker must review carefully) |
-| < 0.60 | **REJECT** |
+**Per-change-type thresholds** (via `settings.thresholds_for()`):
+
+| Change type | Approve ≥ | Flag ≥ |
+|---|---|---|
+| `LEGAL_NAME_CHANGE` | **0.85** | **0.65** |
+| _fallback (any other)_ | 0.80 | 0.60 |
+
+The Legal Name Change bar is higher because `min()`-based scoring means **both** old and new name must clear 0.85 — stricter but fairer than averaging.
+
+### AI-vs-Checker agreement tracking
+
+Every Checker decision records whether it matched the AI's recommendation:
+
+- **agree** — Checker confirmed AI's APPROVE or REJECT
+- **disagree** — Checker overrode AI (e.g. AI said APPROVE, Checker rejected)
+- **deferred** — AI said FLAG; Checker's decision is the authoritative call
+- **unknown** — no AI recommendation recorded
+
+Stats are exposed via `GET /api/checker/agreement-stats` for threshold calibration:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+     http://localhost:8000/api/checker/agreement-stats
+```
+
+Use the output to calibrate thresholds:
+- High `disagree` on APPROVE recommendations → raise the approve threshold
+- High `disagree` on REJECT recommendations → lower the flag threshold
+
+### What the Checker sees in the summary
+
+The Checker UI shows overall confidence, per-field breakdown (old-name vs bride-name, new-name vs married-name), authenticity score, forgery verdict, and the AI recommendation. When forgery is WARN or FAIL, the top forgery signals and Gemini's reasoning are surfaced inline so the human sees *why* to look closer.
 
 The Checker always has final authority regardless of AI recommendation.
+
+### Intentional follow-up work (not in this pass)
+
+- Hard-reject vs advisory-reject split (saves Checker time for obvious junk)
+- Cross-field consistency rules (issue-date sanity, authority plausibility)
+- Velocity / pattern anomaly scoring across the request corpus
 
 ---
 
@@ -390,7 +473,7 @@ GET /api/tasks/{task_id}       ← responds in <55ms while pipeline runs
 |--------|------|-------------|
 | `id` | TEXT PK | UUID v4 |
 | `customer_id` | TEXT | Bank customer identifier |
-| `change_type` | TEXT | `LEGAL_NAME_CHANGE` \| `ADDRESS_CHANGE` \| `DOB_CORRECTION` \| `CONTACT_UPDATE` |
+| `change_type` | TEXT | `LEGAL_NAME_CHANGE` (only supported change type in this prototype) |
 | `old_value` | TEXT | Current value as stored in RPS |
 | `new_value` | TEXT | Requested new value |
 | `extracted_value` | TEXT | AI-extracted value from document |

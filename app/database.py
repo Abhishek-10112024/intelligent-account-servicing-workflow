@@ -111,6 +111,56 @@ class AuditLog(Base):
     created_at  = Column(DateTime, default=datetime.utcnow)
 
 
+# ── Table 3: Users ────────────────────────────────────────────────────────────
+class User(Base):
+    """
+    Authenticated user of the system.
+
+    Roles:
+      - USER   : Can submit Intake requests; cannot access Checker/RPS/audit.
+      - ADMIN  : Can access Checker queue, approve/reject intake requests,
+                 approve pending user registrations, view audit trail.
+
+    Notes:
+      - password_hash stores a bcrypt hash; plaintext passwords never land here.
+      - `active` gates login. Admin-approved registrations flip this to True.
+    """
+    __tablename__ = "users"
+
+    id            = Column(String, primary_key=True)   # UUID
+    username      = Column(String, nullable=False, unique=True, index=True)
+    password_hash = Column(String, nullable=False)
+    role          = Column(String, nullable=False, default="USER")   # USER | ADMIN
+    active        = Column(String, nullable=False, default="true")   # "true" | "false"
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    # Set when this user was created from an approved registration
+    approved_by   = Column(String)                                   # admin username
+
+
+# ── Table 4: User Registrations ───────────────────────────────────────────────
+class UserRegistration(Base):
+    """
+    Self-serve registration request. Admins approve or reject these from the
+    Checker UI. On approval, a row is created in `users`; on rejection, the
+    registration is marked REJECTED and no user is created.
+
+    Lifecycle of `status`:
+      PENDING    → APPROVED  (admin approves, user row created)
+                 → REJECTED  (admin rejects, no user row created)
+    """
+    __tablename__ = "user_registrations"
+
+    id            = Column(String, primary_key=True)   # UUID
+    username      = Column(String, nullable=False, unique=True, index=True)
+    password_hash = Column(String, nullable=False)     # hashed at submission time
+    requested_role = Column(String, nullable=False, default="USER")  # always USER (guarded server-side)
+    status        = Column(String, nullable=False, default="PENDING") # PENDING | APPROVED | REJECTED
+    decision_by   = Column(String)                                    # admin username
+    decision_at   = Column(DateTime)
+    decision_notes = Column(Text)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+
 # ── DB Initialisation ─────────────────────────────────────────────────────────
 def init_db():
     """Create all tables. Called once at application startup."""

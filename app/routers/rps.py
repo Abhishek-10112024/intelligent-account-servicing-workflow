@@ -25,6 +25,9 @@ from fastapi import APIRouter
 
 from app.config import settings
 from app.services.observability import get_logger
+from app.services.auth import require_admin
+from app.database import User
+from fastapi import Depends
 
 router = APIRouter(prefix="/api/rps", tags=["RPS Mock"])
 logger = get_logger("rps_mock")
@@ -73,11 +76,9 @@ def execute_rps_write(
         }
 
     # ── Map change_type → RPS field ───────────────────────────────────────────
+    # Only LEGAL_NAME_CHANGE is supported in this prototype.
     field_map = {
         "LEGAL_NAME_CHANGE": "name",
-        "ADDRESS_CHANGE":    "address",
-        "DOB_CORRECTION":    "dob",
-        "CONTACT_UPDATE":    "phone",
     }
     rps_field = field_map.get(change_type)
     if not rps_field:
@@ -133,7 +134,7 @@ def execute_rps_write(
 
 
 @router.get("/state", summary="Inspect current mock RPS state (debug only)")
-def get_rps_state():
+def get_rps_state(_admin: User = Depends(require_admin)):
     """
     Debug endpoint to inspect the current in-memory mock RPS state.
     Shows the effect of approved changes.

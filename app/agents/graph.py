@@ -82,6 +82,8 @@ class WorkflowState(TypedDict):
     # Populated by process_document
     extracted_fields:         Optional[dict]
     forgery_check:            Optional[str]
+    forgery_signals:          Optional[list]
+    forgery_reasoning:        Optional[str]
     filenet_ref_id:           Optional[str]
     processing_mode:          Optional[str]   # "real" or "mock"
 
@@ -184,18 +186,22 @@ def process_document_node(state: WorkflowState) -> dict:
         actor="document_processor",
         action="DOCUMENT_PROCESSED",
         detail={
-            "forgery_check":   result["forgery_check"],
-            "filenet_ref_id":  result["filenet_ref_id"],
-            "mode":            result["mode"],
-            "fields_extracted": list(result["extracted_fields"].keys()),
+            "forgery_check":     result["forgery_check"],
+            "forgery_signals":   result.get("forgery_signals", []),
+            "forgery_reasoning": result.get("forgery_reasoning", ""),
+            "filenet_ref_id":    result["filenet_ref_id"],
+            "mode":              result["mode"],
+            "fields_extracted":  list(result["extracted_fields"].keys()),
         },
     )
 
     return {
-        "extracted_fields": result["extracted_fields"],
-        "forgery_check":    result["forgery_check"],
-        "filenet_ref_id":   result["filenet_ref_id"],
-        "processing_mode":  result["mode"],
+        "extracted_fields":  result["extracted_fields"],
+        "forgery_check":     result["forgery_check"],
+        "forgery_signals":   result.get("forgery_signals", []),
+        "forgery_reasoning": result.get("forgery_reasoning", ""),
+        "filenet_ref_id":    result["filenet_ref_id"],
+        "processing_mode":   result["mode"],
     }
 
 
@@ -211,6 +217,8 @@ def score_confidence_node(state: WorkflowState) -> dict:
         old_value=state["old_value"],
         new_value=state["new_value"],
         forgery_check=state["forgery_check"],
+        forgery_signals=state.get("forgery_signals") or [],
+        forgery_reasoning=state.get("forgery_reasoning") or "",
     )
 
     log_agent_step(
@@ -354,6 +362,8 @@ def run_iasw_pipeline(
         "rps_current_value":     None,
         "extracted_fields":      None,
         "forgery_check":         None,
+        "forgery_signals":       None,
+        "forgery_reasoning":     None,
         "filenet_ref_id":        None,
         "processing_mode":       None,
         "score_card":            None,

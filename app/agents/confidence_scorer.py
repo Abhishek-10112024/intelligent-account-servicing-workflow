@@ -10,12 +10,16 @@ Responsibility:
 
 Scoring methodology:
   - Name fields: fuzzy token-sort-ratio (handles "Priya Sharma" vs "PRIYA SHARMA")
-  - Document authenticity: weighted combination of extraction confidence + forgery result
+  - Name match combines old and new fields using the WEAKEST LINK (min), so a
+    correct old name + wrong new name cannot average its way to a FLAG.
+  - Document authenticity: weighted combination of extraction confidence and
+    forgery verdict (see _authenticity_score).
   - Overall: weighted average (name_match × 0.6 + authenticity × 0.4)
-  - Thresholds from config: APPROVE_THRESHOLD=0.80, FLAG_THRESHOLD=0.60
+  - Thresholds are per-change-type (see settings.thresholds_for), falling back
+    to global APPROVE_THRESHOLD / FLAG_THRESHOLD.
 
-Design note: We use fuzzywuzzy's token_sort_ratio rather than exact matching to handle
-common OCR artefacts (extra spaces, capitalisation differences, accent variations).
+Design note: We use fuzzywuzzy's token_sort_ratio rather than exact matching to
+handle common OCR artefacts (extra spaces, capitalisation, accent variations).
 """
 
 from fuzzywuzzy import fuzz
@@ -62,7 +66,12 @@ def _authenticity_score(extraction_confidence: str, forgery_result: str) -> floa
 # ── Per-change-type scoring ───────────────────────────────────────────────────
 
 def _score_legal_name_change(extracted: dict, old_value: str, new_value: str) -> dict:
-    """Score a Legal Name Change document (e.g. Marriage Certificate)."""
+    """Score a Legal Name Change document (e.g. Marriage Certificate).
+
+    Uses weakest-link scoring (min of old/new) rather than averaging. A
+    correct old name + wrong new name is a rejection signal, not a pass —
+    averaging them hides asymmetric failures.
+    """
     bride_name   = extracted.get("bride_name") or ""
     married_name = extracted.get("married_name") or ""
     missing_fields = []
@@ -76,39 +85,22 @@ def _score_legal_name_change(extracted: dict, old_value: str, new_value: str) ->
     # New name should match the married name field
     new_match = _fuzzy_score(new_value, married_name)
 
-    # Combine: both matches must be high for full confidence
-    name_match = round((old_match + new_match) / 2, 4)
+    # Weakest-link scoring: BOTH sides must be strong to clear the bar.
+    name_match = round(min(old_match, new_match), 4)
 
     return {
         "name_match":  name_match,
         "field_scores": {
-            "old_name_vs_bride_name":    old_match,
-            "new_name_vs_married_name":  new_match,
+            "old_name_vs_bride_name":    round(old_match, 4),
+            "new_name_vs_married_name":  round(new_match, 4),
         },
         "extracted_name": f"{bride_name} → {married_name}",
         "missing_fields": missing_fields,
     }
 
 
-def _score_address_change(extracted: dict, old_value: str, new_value: str) -> dict:
-    """Score an Address Change document (e.g. Utility Bill)."""
-    doc_address = " ".join(filter(None, [
-        extracted.get("address_line_1", ""),
-        extracted.get("city", ""),
-        extracted.get("state", ""),
-        extracted.get("pincode", ""),
-    ]))
-    name_match = _fuzzy_score(new_value, doc_address)
-    return {
-        "name_match":  name_match,
-        "field_scores": {"new_address_vs_document": name_match},
-        "extracted_name": doc_address,
-    }
-
-
 _SCORERS = {
     "LEGAL_NAME_CHANGE": _score_legal_name_change,
-    "ADDRESS_CHANGE":    _score_address_change,
 }
 
 
@@ -125,25 +117,66 @@ def _build_summary(
     recommendation: str,
     overall: float,
     reject_reason: str | None = None,
+    forgery_signals: list[dict] | None = None,
+    forgery_reasoning: str = "",
+    field_scores: dict[str, float] | None = None,
 ) -> str:
     """Build the human-readable AI summary shown in the Checker Review UI."""
 
     doc_label = {
         "LEGAL_NAME_CHANGE": "Marriage Certificate",
-        "ADDRESS_CHANGE":    "Address Proof",
-        "DOB_CORRECTION":    "Birth Certificate",
-        "CONTACT_UPDATE":    "Contact Proof",
     }.get(change_type, "Supporting Document")
 
     lines = [
         f"**{doc_label} verified.**",
         f"Old value '{old_value}' and new value '{new_value}' were cross-referenced against the extracted document data: '{extracted_name}'.",
         f"Name/Value match confidence: **{name_match*100:.0f}%**.",
+    ]
+
+    # ── Surface per-field breakdown so the Checker sees *why* the score is
+    # what it is, not just a single aggregate number.
+    if field_scores:
+        pretty = {
+            "old_name_vs_bride_name":   "Old name vs document 'bride name'",
+            "new_name_vs_married_name": "New name vs document 'married name'",
+        }
+        bullets = []
+        for key, score in field_scores.items():
+            label = pretty.get(key, key.replace("_", " "))
+            bullets.append(f"  • {label}: {score*100:.0f}%")
+        if bullets:
+            lines.append("Field-level scores:")
+            lines.extend(bullets)
+
+    lines.extend([
         f"Document authenticity score: **{authenticity*100:.0f}%**.",
         f"Forgery check: **{forgery_check}**.",
         f"Overall confidence: **{overall*100:.0f}%**.",
         f"**AI Recommendation: {recommendation}.**",
-    ]
+    ])
+
+    # ── Surface forgery reasoning to the Checker on WARN/FAIL ─────────────────
+    # Keep PASS summaries clean. When there's a concern, show the top signals
+    # so the Checker understands *why* to look closer — not just a single label.
+    if forgery_check in ("WARN", "FAIL"):
+        if forgery_reasoning:
+            lines.append(f"**Forgery analysis:** {forgery_reasoning}")
+
+        if forgery_signals:
+            # Prioritise critical > warn; cap to three signals to keep the UI tight.
+            ranked = sorted(
+                forgery_signals,
+                key=lambda s: 0 if s.get("severity") == "critical" else 1,
+            )[:3]
+            bullet_lines = []
+            for sig in ranked:
+                sev = str(sig.get("severity", "")).upper()
+                name = str(sig.get("name", "")).replace("_", " ")
+                detail = str(sig.get("detail", "")).strip()
+                bullet_lines.append(f"- [{sev}] {name}: {detail}")
+            if bullet_lines:
+                lines.append("**Top forgery signals:**")
+                lines.extend(bullet_lines)
 
     if recommendation == "FLAG":
         lines.append("⚠ One or more scores are below the approval threshold. Please review documents carefully.")
@@ -166,6 +199,8 @@ def compute_confidence(
     old_value:         str,
     new_value:         str,
     forgery_check:     str,
+    forgery_signals:   list[dict] | None = None,
+    forgery_reasoning: str = "",
 ) -> dict:
     """
     Compute the full Confidence Score Card.
@@ -175,26 +210,57 @@ def compute_confidence(
         change_type:       e.g. LEGAL_NAME_CHANGE
         old_value:         Current value in RPS (e.g. "Priya Sharma")
         new_value:         Requested new value (e.g. "Priya Mehta")
-        forgery_check:     PASS / WARN / FAIL from forgery heuristics
+        forgery_check:     PASS / WARN / FAIL verdict from Agent 2
+        forgery_signals:   List of per-signal forgery findings (code + Gemini);
+                           surfaced in the Checker summary on WARN/FAIL.
+        forgery_reasoning: Gemini's natural-language summary of tamper signals.
 
     Returns:
         dict matching ConfidenceScoreCard schema + extra diagnostics.
     """
     logger.info("CONFIDENCE_SCORING_START", change_type=change_type)
 
+    forgery_signals = forgery_signals or []
+
     # ── Field scoring ──────────────────────────────────────────────────────────
     scorer_fn = _SCORERS.get(change_type)
-    if scorer_fn:
-        field_result = scorer_fn(extracted_fields, old_value, new_value)
-    else:
-        # Generic fallback: basic string similarity on any text fields
-        any_text = " ".join(str(v) for v in extracted_fields.values() if isinstance(v, str))
-        match = _fuzzy_score(new_value, any_text)
-        field_result = {
-            "name_match": match,
-            "field_scores": {"generic_match": match},
-            "extracted_name": any_text[:80],
+    if not scorer_fn:
+        # Defence in depth: intake already rejects unsupported types, but if one
+        # ever reaches here, return a hard REJECT rather than scoring via a
+        # generic fuzzy-match fallback (which produces misleading scores).
+        logger.warning("CONFIDENCE_UNSUPPORTED_CHANGE_TYPE", change_type=change_type)
+        reject_reason = (
+            f"change_type '{change_type}' is not supported by the confidence scorer. "
+            f"Supported: {list(_SCORERS.keys())}."
+        )
+        summary = _build_summary(
+            change_type=change_type,
+            old_value=old_value,
+            new_value=new_value,
+            extracted_name="",
+            name_match=0.0,
+            authenticity=0.0,
+            forgery_check=forgery_check,
+            recommendation="REJECT",
+            overall=0.0,
+            reject_reason=reject_reason,
+            forgery_signals=forgery_signals,
+            forgery_reasoning=forgery_reasoning,
+        )
+        return {
+            "name_match":          0.0,
+            "authenticity":        0.0,
+            "forgery_check":       forgery_check,
+            "overall_confidence":  0.0,
+            "recommendation":      "REJECT",
+            "summary":             summary,
+            "field_scores":        {},
+            "extracted_name":      "",
+            "forgery_signals":     forgery_signals,
+            "forgery_reasoning":   forgery_reasoning,
         }
+
+    field_result = scorer_fn(extracted_fields, old_value, new_value)
 
     name_match     = field_result["name_match"]
     extracted_name = field_result.get("extracted_name", "")
@@ -215,30 +281,46 @@ def compute_confidence(
     #   2. WARN forgery → always FLAG, never auto-approve
     #   3. Missing required fields for this change_type → REJECT
     #   4. Document type mismatch (declared vs Gemini-detected) → REJECT
-    #   5. Threshold-based: overall ≥ APPROVE_THRESHOLD → APPROVE
-    #                        overall ≥ FLAG_THRESHOLD   → FLAG
+    #   5. Threshold-based: overall ≥ approve_threshold → APPROVE
+    #                        overall ≥ flag_threshold   → FLAG
     #                        otherwise                  → REJECT
     #
-    # Note: all scores (name_match, authenticity, overall) come directly from
-    # the LLM extraction and fuzzy-match logic above. There is no hardcoded
-    # override — the AI output drives the final recommendation.
+    # Thresholds are per-change-type via settings.thresholds_for().
     # ──────────────────────────────────────────────────────────────────────────
 
     reject_reason = None
+    recommendation: str | None = None
+    approve_threshold, flag_threshold = settings.thresholds_for(change_type)
 
     # ── Step 1: Hard failure — forgery ────────────────────────────────────────
     if forgery_check == "FAIL":
         recommendation = "REJECT"
-        reject_reason = "Document failed authenticity / forgery check."
+        # Build a rich reject reason that includes any other problems (missing
+        # fields, doc-type mismatch). The Checker / staff member gets ONE clear
+        # rejection message, not a sequence of silent skips.
+        reasons = ["Document failed authenticity / forgery check."]
+        if missing_fields:
+            reasons.append(
+                f"Required fields could not be extracted: {', '.join(missing_fields)}."
+            )
+        reject_reason = " ".join(reasons)
 
     # ── Step 2: Forgery warning — demote to FLAG at most ─────────────────────
     elif forgery_check == "WARN":
-        # WARN means we have suspicions but aren't certain; force human review
+        # WARN means we have suspicions but aren't certain; force human review.
         recommendation = "FLAG"
 
     else:
-        # ── Step 3: Document type mismatch ────────────────────────────────────
-        if change_type == "LEGAL_NAME_CHANGE":
+        # ── Step 3: Missing required fields ───────────────────────────────────
+        if missing_fields:
+            recommendation = "REJECT"
+            reject_reason = (
+                f"Required fields could not be extracted: {', '.join(missing_fields)}. "
+                f"Please re-upload a clearer, legible document."
+            )
+
+        # ── Step 4: Document type mismatch ────────────────────────────────────
+        if recommendation is None and change_type == "LEGAL_NAME_CHANGE":
             detected_type = extracted_fields.get("document_type_detected", "")
             expected_type_map = {
                 "MARRIAGE_CERTIFICATE": "Marriage Certificate",
@@ -246,43 +328,48 @@ def compute_confidence(
                 "DEED_POLL":            "Deed Poll",
             }
             expected_type = expected_type_map.get(document_type, document_type)
-            is_expected_type = (
-                expected_type.lower() in detected_type.lower()
-                or detected_type.lower() in expected_type.lower()
-            )
-            if not is_expected_type and detected_type:
-                recommendation = "REJECT"
-                reject_reason = (
-                    f"Document type mismatch. You declared '{expected_type}' "
-                    f"but the AI detected '{detected_type}'. "
-                    f"Please re-upload the correct document."
+            if not detected_type:
+                # Empty detection is a soft concern — Gemini couldn't identify
+                # the document type at all. Force human review rather than
+                # silently passing.
+                recommendation = "FLAG"
+            else:
+                is_expected_type = (
+                    expected_type.lower() in detected_type.lower()
+                    or detected_type.lower() in expected_type.lower()
                 )
-
-        # ── Step 4: Missing required fields ───────────────────────────────────
-        if not reject_reason and missing_fields:
-            recommendation = "REJECT"
-            reject_reason = (
-                f"Required fields could not be extracted: {', '.join(missing_fields)}. "
-                f"Please re-upload a clearer, legible document."
-            )
+                if not is_expected_type:
+                    recommendation = "REJECT"
+                    reject_reason = (
+                        f"Document type mismatch. You declared '{expected_type}' "
+                        f"but the AI detected '{detected_type}'. "
+                        f"Please re-upload the correct document."
+                    )
 
         # ── Step 5: Threshold-based recommendation ────────────────────────────
-        if not reject_reason:
-            if overall >= settings.APPROVE_THRESHOLD:
+        if recommendation is None:
+            if overall >= approve_threshold:
                 recommendation = "APPROVE"
-            elif overall >= settings.FLAG_THRESHOLD:
+            elif overall >= flag_threshold:
                 recommendation = "FLAG"
             else:
                 recommendation = "REJECT"
                 reject_reason = (
                     f"Overall confidence {overall*100:.0f}% is below the "
-                    f"minimum threshold of {settings.FLAG_THRESHOLD*100:.0f}%."
+                    f"minimum threshold of {flag_threshold*100:.0f}%."
                 )
+        elif recommendation == "FLAG" and overall < flag_threshold:
+            # A prior step (empty doc-type detection) set FLAG. If the overall
+            # score is also below the flag threshold, downgrade to REJECT —
+            # don't auto-upgrade past FLAG on high scores with empty detection.
+            recommendation = "REJECT"
+            reject_reason = (
+                f"Overall confidence {overall*100:.0f}% is below the "
+                f"minimum threshold of {flag_threshold*100:.0f}%."
+            )
 
     # ── Summary text ──────────────────────────────────────────────────────────
     # Build the human-readable summary shown in the Checker UI.
-    # Use detected document type if available, otherwise fall back to change_type label.
-    detected_type_for_summary = extracted_fields.get("document_type_detected", "")
     summary = _build_summary(
         change_type=change_type,
         old_value=old_value,
@@ -294,6 +381,9 @@ def compute_confidence(
         recommendation=recommendation,
         overall=overall,
         reject_reason=reject_reason,
+        forgery_signals=forgery_signals,
+        forgery_reasoning=forgery_reasoning,
+        field_scores=field_result.get("field_scores", {}),
     )
 
     score_card = {
@@ -305,6 +395,8 @@ def compute_confidence(
         "summary":             summary,
         "field_scores":        field_result.get("field_scores", {}),
         "extracted_name":      extracted_name,
+        "forgery_signals":     forgery_signals,
+        "forgery_reasoning":   forgery_reasoning,
     }
 
     logger.info(

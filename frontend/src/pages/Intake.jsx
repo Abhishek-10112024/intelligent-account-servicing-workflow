@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
 import { UploadCloud, CheckCircle2, AlertCircle, Loader2, Clock, Zap } from 'lucide-react';
+import api from '../api';
 
-const API = 'http://localhost:8000';
 const POLL_INTERVAL_MS = 2500;
 
 // ── Task status badge helper ──────────────────────────────────────────────────
@@ -42,7 +41,7 @@ export default function Intake() {
 
     const poll = async () => {
       try {
-        const { data } = await axios.get(`${API}/api/tasks/${taskId}`);
+        const { data } = await api.get(`/api/tasks/${taskId}`);
         setTaskStatus(data.status);
 
         if (data.status === 'COMPLETED') {
@@ -103,7 +102,7 @@ export default function Intake() {
 
     try {
       // Backend now returns 202 Accepted with task_id
-      const { data } = await axios.post(`${API}/api/intake`, fd, {
+      const { data } = await api.post(`/api/intake`, fd, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
 

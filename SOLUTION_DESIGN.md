@@ -39,7 +39,7 @@ Core banking account changes require document verification — a slow, manual, e
 | Marriage Certificate verification | Real RPS/core banking write |
 | AI extraction + confidence scoring | Authentication/JWT |
 | HITL Checker UI with approve/reject | Multi-tenant setup |
-| Immutable audit trail | Additional change types (scaffolded, not demoed) |
+| Immutable audit trail | Additional change types (explicitly out of scope; rejected at intake) |
 | Docker containerization + k8s manifests | Mobile UI |
 
 ---
@@ -143,7 +143,7 @@ You are a document verification agent for a bank.
 Analyze the provided document image and extract the following fields.
 Return ONLY valid JSON with exactly these keys:
 {
-  "document_type_detected": "<Marriage Certificate|Utility Bill|...>",
+  "document_type_detected": "<Marriage Certificate|Gazette Notification|Deed Poll|Other/Screenshot>",
   "bride_name": "<name as written on document>",
   "married_name": "<married name as written>",
   "issue_date": "<DD-MM-YYYY>",
@@ -215,7 +215,7 @@ Layer 3: Database Constraint
 |--------|------|-------------|
 | `id` | TEXT PK | UUID v4 |
 | `customer_id` | TEXT NOT NULL | Bank customer ID (e.g., C001) |
-| `change_type` | TEXT NOT NULL | `LEGAL_NAME_CHANGE` \| `ADDRESS_CHANGE` \| etc. |
+| `change_type` | TEXT NOT NULL | `LEGAL_NAME_CHANGE` (only supported change type in this prototype) |
 | `old_value` | TEXT | Current value in RPS |
 | `new_value` | TEXT | Requested new value |
 | `extracted_value` | TEXT | AI-extracted value from document |

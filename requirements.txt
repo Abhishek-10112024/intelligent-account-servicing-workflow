@@ -33,6 +33,11 @@ aiofiles==23.2.1                # Async file I/O helpers
 # ── Observability ─────────────────────────────────────────────────────────────
 structlog==25.5.0               # Structured JSON logging
 
+# ── Auth ──────────────────────────────────────────────────────────────────────
+passlib[bcrypt]==1.7.4          # Password hashing (bcrypt)
+bcrypt==4.0.1                   # Pinned: passlib 1.7.4 is incompatible with bcrypt 4.1+
+python-jose[cryptography]==3.3.0  # JWT encode/decode (HS256)
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.2.2
 httpx==0.28.1

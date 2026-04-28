@@ -7,17 +7,19 @@ GET /api/llm/self-test
   - Returns a small JSON payload suitable for quick interview smoke-testing
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from app.config import settings
 from app.services.observability import get_logger
+from app.services.auth import require_admin
+from app.database import User
 
 router = APIRouter(prefix="/api/llm", tags=["LLM"])
 logger = get_logger("llm_router")
 
 
 @router.get("/self-test", summary="Verify Gemini key + model works")
-def llm_self_test():
+def llm_self_test(_admin: User = Depends(require_admin)):
     if not settings.GEMINI_API_KEY.strip():
         return {
             "ok": False,

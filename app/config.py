@@ -46,18 +46,50 @@ class Settings:
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     REDIS_ENABLED: bool = os.getenv("REDIS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
 
+    # ── Auth (JWT) ─────────────────────────────────────────────────────────────
+    # HS256 JWT with 60-minute expiry. Secret MUST be overridden via env in prod;
+    # the default is a clearly-unsafe placeholder so misconfiguration is obvious.
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "CHANGE-ME-IN-PRODUCTION-dev-only-secret")
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+    # Seeded demo credentials — printed to stdout on first boot.
+    SEED_ADMIN_USERNAME: str = os.getenv("SEED_ADMIN_USERNAME", "admin")
+    SEED_ADMIN_PASSWORD: str = os.getenv("SEED_ADMIN_PASSWORD", "admin123")
+    SEED_USER_USERNAME: str = os.getenv("SEED_USER_USERNAME", "user")
+    SEED_USER_PASSWORD: str = os.getenv("SEED_USER_PASSWORD", "user123")
+
     # ── FileNet mock storage ───────────────────────────────────────────────────
     FILENET_UPLOAD_DIR: Path = _BASE_DIR / os.getenv("FILENET_UPLOAD_DIR", "uploads")
 
     # ── Logging ────────────────────────────────────────────────────────────────
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE: Path = _BASE_DIR / "logs" / "iasw.log"
+    # Dedicated Redis activity log — useful for demos / showing exactly
+    # when & where the cache is being hit, set, or invalidated.
+    REDIS_LOG_FILE: Path = _BASE_DIR / "logs" / "redis.log"
 
     # ── Confidence thresholds ─────────────────────────────────────────────────
-    # Requests with overall confidence above APPROVE_THRESHOLD get "APPROVE" recommendation
+    # Global defaults used when a change_type is not in CHANGE_TYPE_THRESHOLDS.
+    # Requests with overall confidence at or above APPROVE_THRESHOLD get "APPROVE".
+    # Requests below FLAG_THRESHOLD are rejected; between the two are flagged.
     APPROVE_THRESHOLD: float = 0.80
-    # Requests below FLAG_THRESHOLD are flagged for careful Checker review
     FLAG_THRESHOLD: float = 0.60
+
+    # Per-change-type thresholds. Legal name changes warrant a higher bar than
+    # generic text matches because the name_match score now uses the weakest
+    # field (min) rather than an average — a 0.85 auto-approve bar means BOTH
+    # old and new name must clear 0.85, not just average to it.
+    CHANGE_TYPE_THRESHOLDS: dict = {
+        "LEGAL_NAME_CHANGE": {"approve": 0.85, "flag": 0.65},
+    }
+
+    @classmethod
+    def thresholds_for(cls, change_type: str) -> tuple[float, float]:
+        """Return (approve, flag) thresholds for a change_type."""
+        override = cls.CHANGE_TYPE_THRESHOLDS.get(change_type)
+        if override:
+            return override.get("approve", cls.APPROVE_THRESHOLD), override.get("flag", cls.FLAG_THRESHOLD)
+        return cls.APPROVE_THRESHOLD, cls.FLAG_THRESHOLD
 
     # ── App metadata ───────────────────────────────────────────────────────────
     APP_TITLE: str = "Intelligent Account Servicing Workflow"

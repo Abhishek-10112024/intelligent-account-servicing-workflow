@@ -73,9 +73,13 @@ class PendingRequestRead(BaseModel):
 # ── Checker Decision ──────────────────────────────────────────────────────────
 
 class CheckerDecision(BaseModel):
-    """Posted by the Checker Supervisor when approving or rejecting."""
+    """Posted by the Checker Supervisor when approving or rejecting.
+
+    Note: `checker_id` is IGNORED by the server — the admin's identity is taken
+    from the JWT. The field is kept for backward compatibility only.
+    """
     request_id:      str
-    checker_id:      str = Field(..., example="checker_sup_01")
+    checker_id:      Optional[str] = Field(None, deprecated=True, description="Ignored; taken from JWT.")
     decision:        str = Field(..., example="APPROVED")   # APPROVED | REJECTED
     notes:           Optional[str] = Field(None, example="All documents verified.")
 
@@ -99,3 +103,55 @@ class AuditLogRead(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    """Credentials for username/password login."""
+    username: str = Field(..., example="admin")
+    password: str = Field(..., example="admin123")
+
+
+class TokenResponse(BaseModel):
+    """JWT response returned by /api/auth/login."""
+    access_token: str
+    token_type:   str = "bearer"
+    expires_in:   int            # seconds until expiry
+    username:     str
+    role:         str            # USER | ADMIN
+
+
+class MeResponse(BaseModel):
+    """Returned by /api/auth/me so the client can show logged-in state."""
+    username: str
+    role:     str
+    active:   bool
+
+
+class RegisterRequest(BaseModel):
+    """Public registration — always creates a PENDING user registration (role=USER)."""
+    username: str = Field(..., min_length=3, max_length=32, example="alice")
+    password: str = Field(..., min_length=6, max_length=72, example="s3cret!!")
+
+
+class RegistrationRead(BaseModel):
+    """Registration request as seen by admins."""
+    id:             str
+    username:       str
+    requested_role: str
+    status:         str
+    decision_by:    Optional[str]
+    decision_at:    Optional[datetime]
+    decision_notes: Optional[str]
+    created_at:     Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class RegistrationDecision(BaseModel):
+    """Admin decision on a pending registration."""
+    registration_id: str
+    decision:        str = Field(..., example="APPROVED")   # APPROVED | REJECTED
+    notes:           Optional[str] = None

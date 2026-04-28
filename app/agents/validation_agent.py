@@ -57,7 +57,7 @@ def run_validation(
 
     Args:
         customer_id:  Bank customer identifier
-        change_type:  One of LEGAL_NAME_CHANGE | ADDRESS_CHANGE | DOB_CORRECTION | CONTACT_UPDATE
+        change_type:  LEGAL_NAME_CHANGE (only supported change type)
         old_value:    Current value as claimed by staff
 
     Returns:
@@ -78,11 +78,10 @@ def run_validation(
         )
 
     # ── Step 2: Map change_type → RPS field ───────────────────────────────────
+    # Only LEGAL_NAME_CHANGE is supported in this prototype. Intake rejects
+    # other change types before reaching here; this is defence in depth.
     field_map = {
         "LEGAL_NAME_CHANGE": "name",
-        "ADDRESS_CHANGE":    "address",
-        "DOB_CORRECTION":    "dob",
-        "CONTACT_UPDATE":    "phone",
     }
     rps_field = field_map.get(change_type)
     if not rps_field:
