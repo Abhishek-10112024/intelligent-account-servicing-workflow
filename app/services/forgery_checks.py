@@ -161,10 +161,16 @@ def _check_magic_bytes(file_path: Path) -> list[dict[str, Any]]:
     if not any(header.startswith(sig) for sig in expected):
         signals.append({
             "name": "content_type_mismatch",
-            "severity": "critical",
+            "severity": "warn",   # downgraded: phone photos shared via WhatsApp/email
+                                  # are often re-encoded but still valid documents;
+                                  # Gemini can analyse them regardless.
+                                  # Keep as warn (not critical) to surface in audit
+                                  # trail without auto-failing real submissions.
             "detail": (
-                f"File extension '{ext}' does not match actual content. "
-                f"Possible file-type spoofing or polyglot file."
+                f"File extension '{ext}' does not match expected magic bytes. "
+                f"This may indicate re-encoding (e.g. WhatsApp compression, "
+                f"HEIC→JPEG conversion) rather than deliberate spoofing. "
+                f"Review the uploaded file carefully."
             ),
         })
 

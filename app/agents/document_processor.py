@@ -89,12 +89,36 @@ CRITICAL RULES:
 # say "is this a document?". Output is a structured per-signal breakdown so
 # the Checker UI can show the human *why* a request was flagged.
 FORGERY_PROMPT = """
-You are a forensic document examiner for a bank. The image you are analysing is
-claimed to be an official supporting document for an account change request.
+You are a forensic document examiner for a bank in India. The image you are
+analysing is claimed to be an official supporting document for an account
+change request (typically a marriage certificate or gazette notification).
 
 Your ONLY job is to assess whether this document shows tampering, fabrication,
-or AI-generation indicators. Do NOT re-extract fields. Be sceptical by default —
-if you are unsure, say so in the signal detail rather than defaulting to PASS.
+or AI-generation indicators. Do NOT re-extract fields. Be sceptical, but also
+be aware of the following NORMAL characteristics of genuine Indian government
+documents that must NOT be flagged as suspicious:
+
+  ✅ NORMAL for genuine Indian government documents — do NOT flag as tampered:
+  - A passport-size photograph of the parties affixed to the certificate,
+    with an official stamp (seal) overlapping the photo and the paper.
+    This is REQUIRED by government form rules and is a sign of authenticity.
+  - The photograph area may show different JPEG compression than the rest
+    of the document because the photo was physically pasted and then scanned.
+  - Handwritten entries (names, dates, registration numbers) on a printed form.
+  - Multiple stamps / seals (municipal corporation, registrar, sub-divisional
+    magistrate, home department, etc.) — these are normal on Form IV certificates.
+  - Duplicate copy / true copy markings — official duplicate certificates are
+    legitimate and are routinely issued by the Registrar of Marriage.
+  - "SAKA" calendar dates or Haryana Govt. Gaz. (Extra) headers.
+  - Slight skew or curvature from phone photography of a physical certificate.
+  - Absence of EXIF metadata (common for scanned / photographed documents).
+
+  🚫 ACTUAL tamper signals to flag:
+  - Text that appears to float over the background (clone-stamp / copy-paste).
+  - Inconsistent font families or sizes within the same printed section.
+  - AI-generated faces in the photograph (deepfake style, no natural grain).
+  - "SPECIMEN" or "SAMPLE" watermarks.
+  - Misalignment of printed borders/boxes that would be straight on a real form.
 
 Inspect for these signals and return a JSON object with this exact shape:
 
@@ -113,22 +137,20 @@ Inspect for these signals and return a JSON object with this exact shape:
 }
 
 Scoring policy for overall_verdict (MUST follow):
-- FAIL: clear evidence of tampering, a UI screenshot, AI-generated content, a
-  specimen/sample watermark on what is meant to be a real submission, OR the
-  image is plainly NOT an official document (for example: a selfie / passport
-  photo / picture of a person, a random photograph, blank page, scenery,
-  receipt, ID card, or any other non-document content). When in doubt about
-  whether the image is the claimed document type, choose FAIL — not WARN —
-  and explain in "reasoning" that the image does not appear to be an official
-  supporting document.
-- WARN: the image is plausibly an official document but shows one or more
-  soft tamper signals (inconsistent fonts, local recompression, unclear seal
-  geometry) without being conclusive.
-- PASS: the image is clearly an official document of the expected kind and
-  shows no notable tamper signals across any of the above checks.
+- FAIL: clear evidence of TEXT/DATA tampering (pasted text, font mismatch in
+  data fields), AI-generated content, a specimen/sample watermark, OR the image
+  is plainly NOT a document at all (selfie, blank page, screenshot of a UI).
+  Do NOT FAIL a document solely because a photo is overlaid with a stamp —
+  that is a required feature of Indian marriage certificates.
+- WARN: plausibly an official document but shows soft tamper signals
+  (inconsistent fonts in data fields, unclear seal geometry, suspicious
+  local recompression in the TEXT area — not the photograph area).
+- PASS: clearly an official document of the expected kind with no notable
+  tamper signals. Affixed photograph + overlapping stamp = PASS.
 
 Return ONLY the JSON object. No extra text.
 """
+
 
 
 # ── Mock extraction results ───────────────────────────────────────────────────

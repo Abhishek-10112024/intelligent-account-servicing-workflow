@@ -71,22 +71,37 @@ def _score_legal_name_change(extracted: dict, old_value: str, new_value: str) ->
     Uses weakest-link scoring (min of old/new) rather than averaging. A
     correct old name + wrong new name is a rejection signal, not a pass —
     averaging them hides asymmetric failures.
+
+    Special case — Indian / South Asian marriage certificates:
+    Many official formats (Haryana, Maharashtra, etc.) state the BRIDE's
+    pre-marriage name explicitly but do NOT print the post-marriage name.
+    When married_name is null, we score only on bride_name (old-name match)
+    and FLAG for human review rather than hard-reject. The Checker can
+    visually confirm the requested new name is reasonable.
     """
     bride_name   = extracted.get("bride_name") or ""
     married_name = extracted.get("married_name") or ""
     missing_fields = []
     if not bride_name.strip():
         missing_fields.append("bride_name")
-    if not married_name.strip():
-        missing_fields.append("married_name")
 
-    # Old name should match the bride name field
+    # Old name should match the bride name field on the document
     old_match = _fuzzy_score(old_value, bride_name)
-    # New name should match the married name field
-    new_match = _fuzzy_score(new_value, married_name)
 
-    # Weakest-link scoring: BOTH sides must be strong to clear the bar.
-    name_match = round(min(old_match, new_match), 4)
+    if married_name.strip():
+        # Married name is explicitly in the document — full weakest-link scoring
+        new_match  = _fuzzy_score(new_value, married_name)
+        name_match = round(min(old_match, new_match), 4)
+        extracted_str = f"{bride_name} → {married_name}"
+    else:
+        # married_name not stated in document (common for Indian certificates).
+        # Score entirely on old-name match. Cap at FLAG_THRESHOLD so a human
+        # always reviews — they can confirm the requested new name visually.
+        missing_fields.append("married_name (not stated in document — human review required)")
+        new_match  = 0.0          # can't auto-verify
+        # Use old_match but cap at 0.74 to ensure FLAG (not auto-APPROVE)
+        name_match = round(min(old_match, 0.74), 4)
+        extracted_str = f"{bride_name} → [not stated in certificate]"
 
     return {
         "name_match":  name_match,
@@ -94,7 +109,7 @@ def _score_legal_name_change(extracted: dict, old_value: str, new_value: str) ->
             "old_name_vs_bride_name":    round(old_match, 4),
             "new_name_vs_married_name":  round(new_match, 4),
         },
-        "extracted_name": f"{bride_name} → {married_name}",
+        "extracted_name": extracted_str,
         "missing_fields": missing_fields,
     }
 
