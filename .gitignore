@@ -24,6 +24,9 @@ logs/
 # Uploaded documents (runtime data — not source code)
 uploads/
 
+# Database backups (created by 'make backup')
+backups/
+
 # Node
 frontend/node_modules/
 frontend/dist/
