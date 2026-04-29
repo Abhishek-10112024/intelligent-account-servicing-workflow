@@ -7,34 +7,20 @@ CRITICAL DESIGN CONSTRAINT:
   This endpoint is NEVER called directly by the frontend or AI agents.
   It is ONLY callable from checker.py after a Checker has explicitly approved.
   The function execute_rps_write() is imported and called by checker.py.
-
-In production:
-  - This would be an authenticated internal microservice call
-  - The RPS would apply its own idempotency, retry logic, and audit trail
-  - Change would flow through an event bus (e.g., Kafka) to downstream systems
-
-Enhanced with:
-  - Redis cache invalidation for the affected customer after each write
-  - Cached RPS state reads via get_cached_rps_record / set_cached_rps_record
 """
 
 import uuid
 from datetime import datetime
 from sqlalchemy.orm import Session
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import settings
 from app.services.observability import get_logger
 from app.services.auth import require_admin
-from app.database import User
-from fastapi import Depends
+from app.database import User, RpsRecord, get_db
 
 router = APIRouter(prefix="/api/rps", tags=["RPS Mock"])
 logger = get_logger("rps_mock")
-
-# In-memory mock of the RPS state (starts from MOCK_RPS_RECORDS seed)
-# In production: this would be the actual core banking database
-_mock_rps_state: dict = {k: dict(v) for k, v in settings.MOCK_RPS_RECORDS.items()}
 
 
 def execute_rps_write(
@@ -46,37 +32,27 @@ def execute_rps_write(
     db:          Session,
 ) -> dict:
     """
-    Perform the mock RPS write. Only called after Checker approval.
+    Perform the persistent RPS write. Only called after Checker approval.
 
     Steps:
-      1. Verify the customer exists in the mock RPS state
+      1. Verify the customer exists in the rps_records table
       2. Map change_type to the correct RPS field
-      3. Apply the update to the in-memory mock RPS
-      4. Invalidate the Redis RPS cache for this customer (async fire-and-forget)
-      5. Return success/failure result
-
-    Args:
-        request_id:  UUID of the approved PendingRequest (for audit traceability)
-        customer_id: Bank customer identifier
-        change_type: e.g. LEGAL_NAME_CHANGE
-        new_value:   The new value to write
-        checker_id:  ID of the approving Checker (for audit trail)
-        db:          SQLAlchemy session (for logging only)
-
-    Returns:
-        {"success": bool, "message": str, "rps_transaction_id": str}
+      3. Apply the update to the PostgreSQL table
+      4. COMMIT the transaction to make it permanent
+      5. Invalidate the Redis RPS cache for this customer
+      6. Return success/failure result
     """
     # ── Guard: customer must exist in RPS ─────────────────────────────────────
-    if customer_id not in _mock_rps_state:
+    record = db.query(RpsRecord).filter(RpsRecord.customer_id == customer_id).first()
+    if not record:
         logger.error("RPS_WRITE_CUSTOMER_NOT_FOUND", customer_id=customer_id)
         return {
             "success": False,
-            "message": f"Customer '{customer_id}' not found in RPS.",
+            "message": f"Customer '{customer_id}' not found in RPS records.",
             "rps_transaction_id": None,
         }
 
     # ── Map change_type → RPS field ───────────────────────────────────────────
-    # Only LEGAL_NAME_CHANGE is supported in this prototype.
     field_map = {
         "LEGAL_NAME_CHANGE": "name",
     }
@@ -88,14 +64,20 @@ def execute_rps_write(
             "rps_transaction_id": None,
         }
 
-    old_rps_value = _mock_rps_state[customer_id].get(rps_field, "")
+    old_rps_value = getattr(record, rps_field, "")
 
     # ── Apply the update ──────────────────────────────────────────────────────
-    _mock_rps_state[customer_id][rps_field] = new_value
+    setattr(record, rps_field, new_value)
+    record.updated_at = datetime.utcnow()
+    
+    # CRITICAL: Commit the change to the persistent database!
+    db.commit()
+    db.refresh(record)
+    
     rps_txn_id = f"RPS-TXN-{str(uuid.uuid4()).upper()[:10]}"
 
     logger.info(
-        "RPS_WRITE_EXECUTED",
+        "RPS_WRITE_EXECUTED_PERSISTENT",
         rps_transaction_id=rps_txn_id,
         request_id=request_id,
         customer_id=customer_id,
@@ -103,21 +85,16 @@ def execute_rps_write(
         old_value=old_rps_value,
         new_value=new_value,
         approved_by=checker_id,
-        executed_at=datetime.utcnow().isoformat(),
     )
 
-    # ── Invalidate Redis RPS cache for this customer (best-effort) ────────────
-    # Fire-and-forget: we don't block the RPS write on cache availability
+    # ── Invalidate Redis RPS cache ────────────────────────────────────────────
     try:
         import asyncio
         from app.services.cache import invalidate_rps_cache
-
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            # Running inside an async context (FastAPI request) — schedule it
             asyncio.ensure_future(invalidate_rps_cache(customer_id))
         else:
-            # Running in a sync context (tests, CLI) — run directly
             loop.run_until_complete(invalidate_rps_cache(customer_id))
     except Exception as cache_err:
         logger.warning(f"RPS_CACHE_INVALIDATE_FAILED: {cache_err}")
@@ -133,14 +110,31 @@ def execute_rps_write(
     }
 
 
-@router.get("/state", summary="Inspect current mock RPS state (debug only)")
-def get_rps_state(_admin: User = Depends(require_admin)):
+@router.get("/state", summary="Inspect current persistent RPS state (debug only)")
+def get_rps_state(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin)
+):
     """
-    Debug endpoint to inspect the current in-memory mock RPS state.
-    Shows the effect of approved changes.
-    REMOVE or restrict in production.
+    Debug endpoint to inspect the current persistent RPS state in PostgreSQL.
+    Sorted by last update (newest first).
     """
+    # Sorting by updated_at DESC so you see the latest change at the top
+    records = db.query(RpsRecord).order_by(RpsRecord.updated_at.desc()).all()
+    
+    # Convert to dict for response
+    state = {
+        r.customer_id: {
+            "name": r.name,
+            "dob": r.dob,
+            "address": r.address,
+            "phone": r.phone,
+            "email": r.email,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None
+        } for r in records
+    }
+    
     return {
-        "note": "Mock RPS in-memory state. Changes persist only for the current server session.",
-        "records": _mock_rps_state,
+        "note": "Persistent RPS state from PostgreSQL database.",
+        "records": state,
     }
